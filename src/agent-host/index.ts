@@ -3,7 +3,7 @@
  * Runs pi-coding-agent in-process; serves Api/Streams over MessagePort.
  */
 import { createRpcServer } from "../contract/rpc";
-import { registerHandlers } from "./handlers";
+import { applySavedProxySettings, registerHandlers } from "./handlers";
 import { startSessionWatcher } from "./session-watcher";
 import { toolchainRuntime } from "./toolchain-runtime";
 import type { ToolchainSnapshot } from "../shared/toolchains/types";
@@ -17,6 +17,9 @@ const piRuntimeVersion = readPiRuntimeVersion();
 
 const server = createRpcServer();
 const restoreGitRunner = installToolchainGitRunner();
+// Restore persisted proxy settings before any model traffic can start, so the
+// configured proxy takes effect immediately after a restart.
+applySavedProxySettings();
 const stopHandlers = registerHandlers(server);
 const stopWatcher = startSessionWatcher(server);
 

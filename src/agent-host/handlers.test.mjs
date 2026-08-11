@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -55,7 +57,7 @@ async function captureHandlers() {
 
 test("registerHandlers exposes every contract method exactly once", async () => {
   const { handlers } = await captureHandlers();
-  assert.equal(Object.keys(handlers).length, 70);
+  assert.equal(Object.keys(handlers).length, 76);
   for (const method of [
     "host.ping",
     "host.toolchain",
@@ -72,8 +74,14 @@ test("registerHandlers exposes every contract method exactly once", async () => 
     "models.list",
     "models.refresh",
     "models.refreshCancel",
-    "models.preferences.get",
-    "models.preferences.set",
+    "modelsConfig.providers",
+    "modelsConfig.providerModels",
+    "modelsConfig.setProviderOverlay",
+    "modelsConfig.fetchModels",
+    "networkProxy.get",
+    "networkProxy.set",
+    "networkProxy.system",
+    "networkProxy.test",
     "auth.providers",
     "skills.list",
     "plugins.list",
@@ -246,28 +254,6 @@ test("session, model configuration, and auth handlers isolate state and preserve
     ok: true,
     synchronized: true,
   });
-  const preferences = await handlers["models.preferences.get"]({ cwd: root });
-  assert.equal(Array.isArray(preferences.models), true);
-  assert.equal(preferences.enabledModels, null);
-  await assert.rejects(
-    handlers["models.preferences.set"]({ cwd: root, enabledModels: [] }),
-    (error) => error.code === "BAD_REQUEST",
-  );
-  const selectedModel = preferences.models.find((model) => model.provider === "openai");
-  assert.ok(selectedModel, "setting an OpenAI credential should expose OpenAI models");
-  const selectedReference = `${selectedModel.provider}/${selectedModel.id}`;
-  const updatedPreferences = await handlers["models.preferences.set"]({
-    cwd: root,
-    enabledModels: [`${selectedReference}:high`, selectedReference],
-  });
-  assert.deepEqual(updatedPreferences.enabledModels, [selectedReference]);
-  const filteredModels = await handlers["models.list"]({ cwd: root });
-  assert.deepEqual(
-    filteredModels.models.map((model) => `${model.provider}/${model.id}`),
-    [selectedReference],
-  );
-  const resetPreferences = await handlers["models.preferences.set"]({ cwd: root, enabledModels: null });
-  assert.equal(resetPreferences.enabledModels, null);
   await assert.rejects(
     handlers["auth.setApiKey"]({ provider: "amazon-bedrock", key: "not-a-bearer-token" }),
     (error) => error.code === "BAD_REQUEST" && /interactive, multi-field/.test(error.message),
@@ -290,6 +276,112 @@ test("session, model configuration, and auth handlers isolate state and preserve
     (error) => error.code === "PARSE_ERROR",
   );
   assert.equal(readFileSync(modelsPath, "utf8"), "{broken json");
+});
+
+test("built-in provider overlays persist, restore defaults, and filter the model picker", async () => {
+  const { handlers } = await captureHandlers();
+  // Reset the models file left behind by the corrupt-file test above.
+  writeFileSync(path.join(isolatedAgentDirectory, "models.json"), JSON.stringify({ providers: {} }), "utf8");
+
+  const providers = await handlers["modelsConfig.providers"]();
+  const openai = providers.providers.find((p) => p.id === "openai");
+  assert.ok(openai, "openai is a built-in provider");
+  assert.ok(openai.defaultBaseUrl.length > 0);
+  assert.ok(openai.modelCount > 0);
+  assert.equal(openai.enabledModels, undefined);
+
+  const detail = await handlers["modelsConfig.providerModels"]({ providerId: "openai" });
+  assert.equal(detail.provider.id, "openai");
+  assert.ok(detail.models.length > 0);
+  assert.equal(detail.enabledModels, null);
+  await assert.rejects(
+    handlers["modelsConfig.providerModels"]({ providerId: "nope" }),
+    (error) => error.code === "NOT_FOUND",
+  );
+
+  const firstModel = detail.models[0];
+  await handlers["modelsConfig.setProviderOverlay"]({
+    providerId: "openai",
+    baseUrl: "https://proxy.example.com/v1",
+    enabledModels: [firstModel.id],
+  });
+  const stored = await handlers["modelsConfig.get"]();
+  assert.equal(stored.providers.openai.baseUrl, "https://proxy.example.com/v1");
+  assert.deepEqual(stored.providers.openai.enabledModels, [firstModel.id]);
+
+  // Configure the shared credential store so the fresh per-call runtime lists OpenAI.
+  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+
+  const listed = await handlers["models.list"]({ cwd: root });
+  const openaiModels = listed.models.filter((m) => m.provider === "openai");
+  assert.deepEqual(
+    openaiModels.map((m) => m.id),
+    [firstModel.id],
+  );
+
+  // An explicit empty list disables every model of the provider.
+  await handlers["modelsConfig.setProviderOverlay"]({ providerId: "openai", enabledModels: [] });
+  const listedNone = await handlers["models.list"]({ cwd: root });
+  assert.equal(listedNone.models.filter((m) => m.provider === "openai").length, 0);
+
+  // Clearing Base URL + enabled models removes the overlay entirely.
+  await handlers["modelsConfig.setProviderOverlay"]({ providerId: "openai", baseUrl: "", enabledModels: null });
+  const cleared = await handlers["modelsConfig.get"]();
+  assert.equal(cleared.providers.openai, undefined);
+  const listedRestored = await handlers["models.list"]({ cwd: root });
+  assert.ok(listedRestored.models.filter((m) => m.provider === "openai").length > 0);
+
+  await handlers["auth.deleteApiKey"]({ provider: "openai" });
+});
+
+test("modelsConfig.fetchModels validates input and reports failures clearly", async () => {
+  const { handlers } = await captureHandlers();
+  const missing = await handlers["modelsConfig.fetchModels"]({ baseUrl: "" });
+  assert.equal(missing.ok, false);
+  const invalid = await handlers["modelsConfig.fetchModels"]({ baseUrl: "not-a-url" });
+  assert.equal(invalid.ok, false);
+  const badProtocol = await handlers["modelsConfig.fetchModels"]({ baseUrl: "ftp://example.com/v1" });
+  assert.equal(badProtocol.ok, false);
+});
+
+test("modelsConfig.fetchModels supports the Google Generative Language API", async () => {
+  const { handlers } = await captureHandlers();
+  const seenKeys = new Set();
+  const seenTokens = new Set();
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://x");
+    const key = req.headers["x-goog-api-key"];
+    seenKeys.add(key ?? "(none)");
+    assert.equal(url.pathname, "/v1beta/models");
+    assert.equal(key, "TESTKEY");
+    const pageToken = url.searchParams.get("pageToken") ?? "";
+    seenTokens.add(pageToken || "(first)");
+    const models = [{ name: "models/gemini-2.5-pro", displayName: "Gemini 2.5 Pro" }];
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(pageToken === "next" ? { models } : { models, nextPageToken: "next" }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (url, options) => {
+    const u = new URL(url);
+    if (u.hostname === "generativelanguage.googleapis.com") {
+      return realFetch(`http://127.0.0.1:${port}${u.pathname}${u.search}`, options);
+    }
+    return realFetch(url, options);
+  };
+  try {
+    const res = await handlers["modelsConfig.fetchModels"]({
+      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      apiKey: "TESTKEY",
+    });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.models, [{ id: "gemini-2.5-pro", name: "Gemini 2.5 Pro" }]);
+    assert.ok(seenTokens.size >= 2, "pagination followed via nextPageToken");
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
 });
 
 test("sessions.get returns the contract shape without rescanning known session paths", async (t) => {
@@ -410,4 +502,268 @@ test("sessions.get returns the contract shape without rescanning known session p
     handlers["sessions.entryContent"]({ id: sessionId, entryId: "another-session-entry", blockIndex: 0 }),
     (error) => error.code === "NOT_FOUND",
   );
+});
+
+test("parseProxyServerString handles Windows ProxyServer formats", async () => {
+  const { parseProxyServerString } = await loadHandlersModule();
+  // Per-protocol form
+  assert.deepEqual(parseProxyServerString("http=127.0.0.1:7890;https=127.0.0.1:7891;ftp=127.0.0.1:21"), {
+    httpProxy: "http://127.0.0.1:7890",
+    httpsProxy: "http://127.0.0.1:7891",
+    enabled: true,
+  });
+  // Bare host:port applies to both protocols
+  assert.deepEqual(parseProxyServerString("127.0.0.1:7890"), {
+    httpProxy: "http://127.0.0.1:7890",
+    httpsProxy: "http://127.0.0.1:7890",
+    enabled: true,
+  });
+  // Legacy secure= suffix
+  assert.deepEqual(parseProxyServerString("10.0.0.1:8080;secure=10.0.0.1:8443"), {
+    httpProxy: "http://10.0.0.1:8080",
+    httpsProxy: "http://10.0.0.1:8443",
+    enabled: true,
+  });
+  // https= without a scheme means an HTTP-transport proxy used for HTTPS traffic
+  assert.deepEqual(parseProxyServerString("https=proxy.example.com:443"), {
+    httpProxy: "",
+    httpsProxy: "http://proxy.example.com:443",
+    enabled: true,
+  });
+  // Explicit scheme in the value is preserved
+  assert.deepEqual(parseProxyServerString("https=https://proxy.example.com:443"), {
+    httpProxy: "",
+    httpsProxy: "https://proxy.example.com:443",
+    enabled: true,
+  });
+  // Empty / no proxy
+  assert.deepEqual(parseProxyServerString(""), {
+    httpProxy: "",
+    httpsProxy: "",
+    enabled: false,
+  });
+});
+
+test("models.list ignores a stale global enabledModels allowlist in settings.json", async () => {
+  const { handlers } = await captureHandlers();
+  // The legacy model selector's global allowlist (settings.json `enabledModels`)
+  // has no UI or handler anymore; it must not cap the chat picker. Only the
+  // per-provider overlay in models.json filters models.
+  const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ enabledModels: ["gemini-3.5-flash"] }, null, 2));
+  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+  const listed = await handlers["models.list"]({ cwd: root });
+  const openaiModels = listed.models.filter((m) => m.provider === "openai");
+  assert.ok(openaiModels.length > 1, "global allowlist must not restrict openai models");
+  rmSync(settingsPath, { force: true });
+  await handlers["auth.deleteApiKey"]({ provider: "openai" });
+});
+
+test("testProxyConnectivity probes through a working proxy and reports failures", async () => {
+  const { testProxyConnectivity } = await loadHandlersModule();
+
+  // No proxy configured
+  assert.deepEqual(await testProxyConnectivity("", ""), {
+    ok: false,
+    error: "No proxy configured",
+    probes: [],
+  });
+
+  // Invalid proxy URL fails cleanly instead of throwing
+  const invalid = await testProxyConnectivity("not a url", "", [{ protocol: "http", url: "http://127.0.0.1:1/probe" }]);
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.probes.length, 1);
+  assert.equal(invalid.probes[0].ok, false);
+
+  // Working local proxy. undici tunnels even plain-HTTP traffic through
+  // CONNECT, so the mock must answer CONNECT and pipe to the real target.
+  const target = http.createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  });
+  await new Promise((resolve) => target.listen(0, "127.0.0.1", resolve));
+  const targetAddress = target.address();
+  assert.ok(targetAddress && typeof targetAddress === "object");
+  const targetPort = targetAddress.port;
+
+  const proxy = http.createServer();
+  proxy.on("connect", (req, clientSocket, head) => {
+    const [host, port] = req.url.split(":");
+    const upstream = net.connect(Number(port), host, () => {
+      clientSocket.write("HTTP/1.1 200 Connection Established" + "\r\n\r\n");
+      if (head && head.length > 0) upstream.write(head);
+      upstream.pipe(clientSocket);
+      clientSocket.pipe(upstream);
+    });
+    upstream.on("error", () => clientSocket.destroy());
+  });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const proxyAddress = proxy.address();
+  assert.ok(proxyAddress && typeof proxyAddress === "object");
+  const proxyPort = proxyAddress.port;
+  try {
+    const result = await testProxyConnectivity(`http://127.0.0.1:${proxyPort}`, "", [
+      { protocol: "http", url: `http://127.0.0.1:${targetPort}/probe` },
+    ]);
+    assert.equal(result.ok, true);
+    assert.equal(result.probes.length, 1);
+    assert.equal(result.probes[0].ok, true);
+    assert.equal(result.probes[0].status, 200);
+    assert.ok(typeof result.probes[0].latencyMs === "number");
+
+    // Refused upstream reports a failure
+    const refused = await testProxyConnectivity(`http://127.0.0.1:${proxyPort}`, "", [
+      { protocol: "http", url: "http://127.0.0.1:1/probe" },
+    ]);
+    assert.equal(refused.ok, false);
+    assert.equal(refused.probes[0].ok, false);
+  } finally {
+    proxy.close();
+    target.close();
+  }
+});
+test("parseScutilProxyOutput handles real scutil --proxy formats", async () => {
+  const { parseScutilProxyOutput } = await loadHandlersModule();
+  // Manual HTTP + HTTPS proxy (typical ClashX / Surge setup)
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  ExceptionsList : <array> {
+    0 : *.local
+  }
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : 127.0.0.1
+  HTTPSEnable : 1
+  HTTPSPort : 7890
+  HTTPSProxy : 127.0.0.1
+  ProxyAutoConfigEnable : 0
+  SOCKSEnable : 0
+}`),
+    { httpProxy: "http://127.0.0.1:7890", httpsProxy: "http://127.0.0.1:7890", enabled: true },
+  );
+
+  // HTTP only: HTTPS falls back to the HTTP proxy
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 8080
+  HTTPProxy : proxy.example.com
+}`),
+    { httpProxy: "http://proxy.example.com:8080", httpsProxy: "http://proxy.example.com:8080", enabled: true },
+  );
+
+  // Missing or zero port: omitted from the URL
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  HTTPEnable : 1
+  HTTPProxy : 10.0.0.1
+  HTTPPort : 0
+}`),
+    { httpProxy: "http://10.0.0.1", httpsProxy: "http://10.0.0.1", enabled: true },
+  );
+
+  // <NULL> values are treated as unset, never as literal hosts
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  HTTPEnable : 1
+  HTTPProxy : <NULL>
+  HTTPSEnable : 0
+}`),
+    { httpProxy: "", httpsProxy: "", enabled: false },
+  );
+
+  // PAC mode: the URL is a script, not a usable proxy endpoint
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  ProxyAutoConfigEnable : 1
+  ProxyAutoConfigURLString : http://pac.example.com/proxy.pac
+  HTTPEnable : 0
+}`),
+    { httpProxy: "", httpsProxy: "", enabled: false },
+  );
+
+  // IPv6 host is bracketed into a valid URL
+  assert.deepEqual(
+    parseScutilProxyOutput(`<dictionary> {
+  HTTPEnable : 1
+  HTTPPort : 7890
+  HTTPProxy : ::1
+}`),
+    { httpProxy: "http://[::1]:7890", httpsProxy: "http://[::1]:7890", enabled: true },
+  );
+
+  // No proxy configured at all
+  assert.deepEqual(parseScutilProxyOutput(`<dictionary> {\n}\n`), {
+    httpProxy: "",
+    httpsProxy: "",
+    enabled: false,
+  });
+});
+
+test("networkProxy.set persists settings.json and preserves unrelated keys", async () => {
+  const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ npmCommand: ["npm"] }, null, 2));
+  const { handlers } = await captureHandlers();
+  try {
+    const result = await handlers["networkProxy.set"]({ httpProxy: "http://127.0.0.1:7890" });
+    assert.equal(result.ok, true);
+    assert.equal(result.applied, true);
+    const stored = JSON.parse(readFileSync(settingsPath, "utf8"));
+    assert.equal(stored.httpProxy, "http://127.0.0.1:7890");
+    assert.deepEqual(stored.npmCommand, ["npm"], "unrelated settings keys must survive a proxy update");
+    assert.deepEqual(await handlers["networkProxy.get"](), {
+      httpProxy: "http://127.0.0.1:7890",
+      httpsProxy: "",
+    });
+
+    // Clearing both fields removes them from settings.json
+    await handlers["networkProxy.set"]({ httpProxy: "", httpsProxy: "" });
+    const cleared = JSON.parse(readFileSync(settingsPath, "utf8"));
+    assert.equal("httpProxy" in cleared, false);
+    assert.equal("httpsProxy" in cleared, false);
+    assert.deepEqual(cleared.npmCommand, ["npm"]);
+  } finally {
+    writeFileSync(settingsPath, JSON.stringify({}, null, 2));
+  }
+});
+
+test("corrupt settings.json surfaces PARSE_ERROR and is never overwritten", async () => {
+  const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
+  const corrupt = "{ definitely not valid json";
+  writeFileSync(settingsPath, corrupt);
+  const { handlers } = await captureHandlers();
+  try {
+    assert.throws(
+      () => handlers["networkProxy.get"](),
+      (error) => error?.code === "PARSE_ERROR",
+    );
+    assert.throws(
+      () => handlers["networkProxy.set"]({ httpProxy: "http://127.0.0.1:7890" }),
+      (error) => error?.code === "PARSE_ERROR",
+    );
+    assert.equal(readFileSync(settingsPath, "utf8"), corrupt, "corrupt settings.json must not be clobbered");
+  } finally {
+    writeFileSync(settingsPath, JSON.stringify({}, null, 2));
+  }
+});
+
+test("applySavedProxySettings restores proxy env vars from settings.json", async () => {
+  const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
+  writeFileSync(settingsPath, JSON.stringify({ httpProxy: "http://proxy.local:8080" }, null, 2));
+  const { applySavedProxySettings } = await loadHandlersModule();
+  const savedHttp = process.env.HTTP_PROXY;
+  const savedHttps = process.env.HTTPS_PROXY;
+  delete process.env.HTTP_PROXY;
+  delete process.env.HTTPS_PROXY;
+  try {
+    applySavedProxySettings();
+    assert.equal(process.env.HTTP_PROXY, "http://proxy.local:8080");
+    assert.equal(process.env.HTTPS_PROXY, "http://proxy.local:8080", "HTTPS falls back to the HTTP proxy");
+  } finally {
+    if (savedHttp !== undefined) process.env.HTTP_PROXY = savedHttp;
+    else delete process.env.HTTP_PROXY;
+    if (savedHttps !== undefined) process.env.HTTPS_PROXY = savedHttps;
+    else delete process.env.HTTPS_PROXY;
+    writeFileSync(settingsPath, JSON.stringify({}, null, 2));
+  }
 });
