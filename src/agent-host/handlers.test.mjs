@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -11,11 +11,21 @@ import { CredentialSynchronizationError } from "@earendil-works/pi-coding-agent"
 import { build } from "esbuild";
 
 const root = path.resolve(import.meta.dirname, "..", "..");
-const isolatedAgentDirectory = mkdtempSync(path.join(tmpdir(), "pi-handler-agent-"));
+// Desktop config lives next to the agent dir (<base>/desktop), so isolate both
+// under one temp base to keep tests from touching the real ~/.pi/desktop.
+const isolatedBaseDirectory = mkdtempSync(path.join(tmpdir(), "pi-handler-base-"));
+const isolatedAgentDirectory = path.join(isolatedBaseDirectory, "agent");
+mkdirSync(isolatedAgentDirectory, { recursive: true });
 process.env.PI_CODING_AGENT_DIR = isolatedAgentDirectory;
 process.env.PI_CODING_AGENT_SESSION_DIR = path.join(isolatedAgentDirectory, "sessions");
 process.env.PI_OFFLINE = "1";
-process.once("exit", () => rmSync(isolatedAgentDirectory, { recursive: true, force: true }));
+process.once("exit", () => rmSync(isolatedBaseDirectory, { recursive: true, force: true }));
+// Enabled-model filters are split across two files: pi's native `enabledModels`
+// key in the agent settings file pi itself reads (`<base>/agent/settings.json`),
+// and the desktop-owned per-provider map in `<base>/desktop/settings.json`
+// (which pi's CLI never reads).
+const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
+const desktopSettingsPath = path.join(isolatedBaseDirectory, "desktop", "settings.json");
 let modulePromise;
 
 async function loadHandlersModule() {
@@ -271,17 +281,21 @@ test("session, model configuration, and auth handlers isolate state and preserve
 
   const modelsPath = path.join(isolatedAgentDirectory, "models.json");
   writeFileSync(modelsPath, "{broken json", "utf8");
-  assert.throws(
-    () => handlers["modelsConfig.get"](),
-    (error) => error.code === "PARSE_ERROR",
-  );
+  await assert.rejects(handlers["modelsConfig.get"](), (error) => error.code === "PARSE_ERROR");
   assert.equal(readFileSync(modelsPath, "utf8"), "{broken json");
 });
 
 test("built-in provider overlays persist, restore defaults, and filter the model picker", async () => {
   const { handlers } = await captureHandlers();
-  // Reset the models file left behind by the corrupt-file test above.
+  // Reset the models + settings files left behind by earlier tests.
   writeFileSync(path.join(isolatedAgentDirectory, "models.json"), JSON.stringify({ providers: {} }), "utf8");
+  rmSync(settingsPath, { force: true });
+
+  // Configure credentials FIRST: the mirror only emits patterns for providers
+  // pi actually resolves (configured ones), so openai + google must be
+  // connected before their models can be filtered.
+  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+  await handlers["auth.setApiKey"]({ provider: "google", key: "secret" });
 
   const providers = await handlers["modelsConfig.providers"]();
   const openai = providers.providers.find((p) => p.id === "openai");
@@ -307,10 +321,34 @@ test("built-in provider overlays persist, restore defaults, and filter the model
   });
   const stored = await handlers["modelsConfig.get"]();
   assert.equal(stored.providers.openai.baseUrl, "https://proxy.example.com/v1");
-  assert.deepEqual(stored.providers.openai.enabledModels, [firstModel.id]);
-
-  // Configure the shared credential store so the fresh per-call runtime lists OpenAI.
-  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+  // The enabled-model filter must NOT be persisted inside models.json — pi's CLI
+  // rejects `enabledModels` in provider entries. It lives in the agent settings
+  // file under pi's native `enabledModels` key (which the pi CLI reads itself).
+  assert.equal(stored.providers.openai.enabledModels, undefined);
+  const agentSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(
+    agentSettings.enabledModels.includes(`openai/${firstModel.id}`),
+    "the filter must be written as a pi-native enabledModels pattern",
+  );
+  assert.ok(
+    agentSettings.enabledModels.some((pattern) => pattern.endsWith("/**")),
+    "unfiltered configured providers must stay enabled via providerId/** patterns",
+  );
+  const desktopSettings = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.deepEqual(
+    desktopSettings.piDesktopModelFilters.openai,
+    [firstModel.id],
+    "the desktop-owned per-provider map lives in the desktop settings file",
+  );
+  // Patterns must never be emitted for unconfigured providers — pi has no
+  // models for them, so every such pattern would warn "No models match pattern".
+  for (const id of ["anthropic", "amazon-bedrock", "groq"]) {
+    assert.equal(
+      agentSettings.enabledModels.some((pattern) => pattern.startsWith(`${id}/`)),
+      false,
+      `unconfigured ${id} must not appear in the enabledModels mirror`,
+    );
+  }
 
   const listed = await handlers["models.list"]({ cwd: root });
   const openaiModels = listed.models.filter((m) => m.provider === "openai");
@@ -323,6 +361,22 @@ test("built-in provider overlays persist, restore defaults, and filter the model
   await handlers["modelsConfig.setProviderOverlay"]({ providerId: "openai", enabledModels: [] });
   const listedNone = await handlers["models.list"]({ cwd: root });
   assert.equal(listedNone.models.filter((m) => m.provider === "openai").length, 0);
+  const settingsNone = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(
+    settingsNone.enabledModels.some((pattern) => pattern.startsWith("openai/")),
+    false,
+    "an empty list must not emit openai patterns",
+  );
+  const desktopSettingsNone = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.deepEqual(
+    desktopSettingsNone.piDesktopModelFilters.openai,
+    [],
+    "explicit empty list stays in the desktop map",
+  );
+  // The explicit "disable every model" state must round-trip through the panel
+  // (an empty list, not the ambiguous "no filter").
+  const detailNone = await handlers["modelsConfig.providerModels"]({ providerId: "openai" });
+  assert.deepEqual(detailNone.enabledModels, []);
 
   // Clearing Base URL + enabled models removes the overlay entirely.
   await handlers["modelsConfig.setProviderOverlay"]({ providerId: "openai", baseUrl: "", enabledModels: null });
@@ -330,7 +384,259 @@ test("built-in provider overlays persist, restore defaults, and filter the model
   assert.equal(cleared.providers.openai, undefined);
   const listedRestored = await handlers["models.list"]({ cwd: root });
   assert.ok(listedRestored.models.filter((m) => m.provider === "openai").length > 0);
+  const settingsCleared = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(
+    settingsCleared.enabledModels,
+    undefined,
+    "clearing the last filter must remove the enabledModels key entirely",
+  );
+  const desktopSettingsCleared = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.equal(
+    desktopSettingsCleared.piDesktopModelFilters,
+    undefined,
+    "clearing the last filter must remove the desktop map key entirely",
+  );
 
+  await handlers["auth.deleteApiKey"]({ provider: "openai" });
+  await handlers["auth.deleteApiKey"]({ provider: "google" });
+});
+
+test("legacy enabledModels in models.json migrate into the agent settings file", async () => {
+  const { handlers } = await captureHandlers();
+  const modelsPath = path.join(isolatedAgentDirectory, "models.json");
+
+  // Older desktop versions persisted the filter inside models.json, which pi's
+  // CLI rejects. Reading must lift it into the agent settings `enabledModels`
+  // and drop the leftover (an entry left with no pi-recognized fields would
+  // still fail validation).
+  // openai must be configured first: the mirror only emits patterns for
+  // providers pi actually resolves, so a legacy filter for an unconfigured
+  // provider is kept in the desktop map but not mirrored (pi has no models
+  // for it and would warn on the pattern).
+  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+  writeFileSync(
+    modelsPath,
+    JSON.stringify({ providers: { openai: { enabledModels: ["gpt-4o", "gpt-4o-mini"] } } }, null, 2),
+    "utf8",
+  );
+  rmSync(settingsPath, { force: true });
+
+  const stored = await handlers["modelsConfig.get"]();
+  assert.equal(stored.providers.openai, undefined);
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(settings.enabledModels.includes("openai/gpt-4o"));
+  assert.ok(settings.enabledModels.includes("openai/gpt-4o-mini"));
+  assert.deepEqual(JSON.parse(readFileSync(modelsPath, "utf8")), { providers: {} });
+
+  // A full-config save carrying the legacy field must lift it out of models.json.
+  rmSync(settingsPath, { force: true });
+  const legacySnapshot = {
+    providers: { openai: { baseUrl: "https://proxy.example.com/v1", enabledModels: ["gpt-4o"] } },
+  };
+  assert.deepEqual(await handlers["modelsConfig.set"](legacySnapshot), { ok: true });
+  const storedAfterSet = await handlers["modelsConfig.get"]();
+  assert.equal(storedAfterSet.providers.openai.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(storedAfterSet.providers.openai.enabledModels, undefined);
+  const settingsAfterSet = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(settingsAfterSet.enabledModels.includes("openai/gpt-4o"));
+
+  // Restore a clean state for the tests that follow.
+  writeFileSync(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf8");
+  rmSync(settingsPath, { force: true });
+  await handlers["auth.deleteApiKey"]({ provider: "openai" });
+});
+
+test("runStartupMigrations lifts legacy enabledModels out of models.json at startup", async () => {
+  const { handlers } = await captureHandlers();
+  const { runStartupMigrations } = await loadHandlersModule();
+  const modelsPath = path.join(isolatedAgentDirectory, "models.json");
+  // google must be configured so its migrated filter pattern is mirrored
+  // (unconfigured providers are kept in the map but never mirrored).
+  await handlers["auth.setApiKey"]({ provider: "google", key: "secret" });
+  writeFileSync(
+    modelsPath,
+    JSON.stringify(
+      {
+        providers: {
+          google: {
+            baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+            enabledModels: ["gemini-2.5-pro"],
+          },
+        },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  rmSync(settingsPath, { force: true });
+
+  await runStartupMigrations();
+
+  const rewritten = JSON.parse(readFileSync(modelsPath, "utf8"));
+  assert.equal(rewritten.providers.google.baseUrl, "https://generativelanguage.googleapis.com/v1beta");
+  assert.equal(rewritten.providers.google.enabledModels, undefined);
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(settings.enabledModels.includes("google/gemini-2.5-pro"));
+
+  // Idempotent: a second run must not rewrite either file.
+  const modelsBefore = readFileSync(modelsPath, "utf8");
+  const settingsBefore = readFileSync(settingsPath, "utf8");
+  await runStartupMigrations();
+  assert.equal(readFileSync(modelsPath, "utf8"), modelsBefore);
+  assert.equal(readFileSync(settingsPath, "utf8"), settingsBefore);
+
+  // Restore a clean state for the tests that follow.
+  writeFileSync(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf8");
+  rmSync(settingsPath, { force: true });
+  await handlers["auth.deleteApiKey"]({ provider: "google" });
+});
+
+test("legacy sidecar file and desktop settings map key migrate into the canonical files", async () => {
+  const { handlers } = await captureHandlers();
+  const { migrateLegacyProviderModelFilters, runStartupMigrations } = await loadHandlersModule();
+  const legacyPath = path.join(isolatedAgentDirectory, "pi-desktop-provider-model-filters.json");
+  // google + anthropic must be configured so their migrated patterns are
+  // mirrored; openai stays unconfigured (empty list → no pattern anyway).
+  await handlers["auth.setApiKey"]({ provider: "google", key: "secret" });
+  await handlers["auth.setApiKey"]({ provider: "anthropic", key: "secret" });
+
+  // Earlier desktop versions stored the filter in <agent dir>/pi-desktop-provider-
+  // model-filters.json; it must move into the desktop-owned map (mirrored to the
+  // agent settings `enabledModels` key) and the legacy file removed.
+  writeFileSync(legacyPath, JSON.stringify({ google: ["gemini-2.5-pro"], openai: [] }, null, 2), "utf8");
+  rmSync(settingsPath, { force: true });
+  rmSync(desktopSettingsPath, { force: true });
+
+  await migrateLegacyProviderModelFilters();
+
+  assert.equal(existsSync(legacyPath), false);
+  const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(settings.enabledModels.includes("google/gemini-2.5-pro"));
+  assert.equal(
+    settings.enabledModels.some((pattern) => pattern.startsWith("openai/")),
+    false,
+    "an empty list must not emit openai patterns",
+  );
+  const desktopSettings = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.deepEqual(desktopSettings.piDesktopModelFilters.google, ["gemini-2.5-pro"]);
+  assert.deepEqual(desktopSettings.piDesktopModelFilters.openai, []);
+
+  // runStartupMigrations also renames the legacy `providerModelFilters` key an
+  // intermediate desktop version wrote into ~/.pi/desktop/settings.json to
+  // `piDesktopModelFilters` (the desktop settings file is kept — it is the
+  // canonical home of the map).
+  writeFileSync(legacyPath, JSON.stringify({ google: ["gemini-3.5-flash"] }, null, 2), "utf8");
+  writeFileSync(
+    desktopSettingsPath,
+    JSON.stringify({ providerModelFilters: { anthropic: ["claude"] }, windowX: 10 }, null, 2),
+    "utf8",
+  );
+  rmSync(settingsPath, { force: true });
+  await runStartupMigrations();
+  assert.equal(existsSync(legacyPath), false);
+  const merged = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.ok(merged.enabledModels.includes("google/gemini-3.5-flash"));
+  assert.ok(merged.enabledModels.includes("anthropic/claude"));
+  const mergedDesktop = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.equal(
+    mergedDesktop.providerModelFilters,
+    undefined,
+    "the legacy providerModelFilters key must be renamed, not kept alongside",
+  );
+  assert.deepEqual(mergedDesktop.piDesktopModelFilters.google, ["gemini-3.5-flash"]);
+  assert.deepEqual(mergedDesktop.piDesktopModelFilters.anthropic, ["claude"]);
+  assert.equal(mergedDesktop.windowX, 10, "unrelated desktop settings keys are preserved");
+
+  // Idempotent: a second run must not rewrite either file.
+  const settingsBefore = readFileSync(settingsPath, "utf8");
+  const desktopBefore = readFileSync(desktopSettingsPath, "utf8");
+  await runStartupMigrations();
+  assert.equal(readFileSync(settingsPath, "utf8"), settingsBefore);
+  assert.equal(readFileSync(desktopSettingsPath, "utf8"), desktopBefore);
+
+  rmSync(settingsPath, { force: true });
+  rmSync(desktopSettingsPath, { force: true });
+  await handlers["auth.deleteApiKey"]({ provider: "google" });
+  await handlers["auth.deleteApiKey"]({ provider: "anthropic" });
+});
+
+test("piDesktopModelFilters left in agent settings.json moves into the desktop settings file", async () => {
+  const { handlers } = await captureHandlers();
+  const { runStartupMigrations } = await loadHandlersModule();
+  const modelsPath = path.join(isolatedAgentDirectory, "models.json");
+  writeFileSync(modelsPath, JSON.stringify({ providers: {} }, null, 2), "utf8");
+  // openai must be configured so its migrated pattern is mirrored; groq stays
+  // unconfigured (kept in the desktop map, never mirrored).
+  await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
+  // A recent desktop version stored the desktop-owned map in the agent settings
+  // file; it must move to ~/.pi/desktop/settings.json (pi never reads that
+  // file, so only pi-native fields stay in the agent settings file).
+  writeFileSync(
+    settingsPath,
+    JSON.stringify(
+      {
+        windowX: 5,
+        enabledModels: ["openai/gpt-4"],
+        piDesktopModelFilters: { openai: ["gpt-4"], groq: [] },
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  rmSync(desktopSettingsPath, { force: true });
+
+  await runStartupMigrations();
+
+  const agent = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(
+    agent.piDesktopModelFilters,
+    undefined,
+    "the desktop-owned map must leave the agent settings file pi parses",
+  );
+  assert.equal(agent.windowX, 5, "unrelated agent settings keys are preserved");
+  assert.ok(agent.enabledModels.includes("openai/gpt-4"));
+  assert.equal(
+    agent.enabledModels.some((p) => p.startsWith("groq/")),
+    false,
+    "unconfigured providers must not be mirrored",
+  );
+  const desktop = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.deepEqual(desktop.piDesktopModelFilters.openai, ["gpt-4"]);
+  assert.deepEqual(desktop.piDesktopModelFilters.groq, [], "unconfigured providers stay in the desktop map");
+  assert.equal(desktop.enabledModels, undefined, "no pi-native key belongs in the desktop settings file");
+
+  // Idempotent: a second run must not rewrite either file.
+  const agentBefore = readFileSync(settingsPath, "utf8");
+  const desktopBefore = readFileSync(desktopSettingsPath, "utf8");
+  await runStartupMigrations();
+  assert.equal(readFileSync(settingsPath, "utf8"), agentBefore);
+  assert.equal(readFileSync(desktopSettingsPath, "utf8"), desktopBefore);
+
+  // The stored map is the user's explicit state: an explicit empty list must
+  // win over the pattern-derived guess (the `openai/<first>` pattern would
+  // otherwise derive `openai: [<first>]`).
+  const detail = await handlers["modelsConfig.providerModels"]({ providerId: "openai" });
+  const firstId = detail.models[0].id;
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ enabledModels: [`openai/${firstId}`], piDesktopModelFilters: { openai: [] } }, null, 2),
+    "utf8",
+  );
+  rmSync(desktopSettingsPath, { force: true });
+  await runStartupMigrations();
+  const desktopOverride = JSON.parse(readFileSync(desktopSettingsPath, "utf8"));
+  assert.deepEqual(
+    desktopOverride.piDesktopModelFilters.openai,
+    [],
+    "explicit stored state overrides the pattern-derived guess",
+  );
+  const agentOverride = JSON.parse(readFileSync(settingsPath, "utf8"));
+  assert.equal(agentOverride.piDesktopModelFilters, undefined, "the agent-side map key is self-healed");
+
+  rmSync(settingsPath, { force: true });
+  rmSync(desktopSettingsPath, { force: true });
   await handlers["auth.deleteApiKey"]({ provider: "openai" });
 });
 
@@ -544,19 +850,70 @@ test("parseProxyServerString handles Windows ProxyServer formats", async () => {
   });
 });
 
-test("models.list ignores a stale global enabledModels allowlist in settings.json", async () => {
+test("models.list honors enabledModels in agent settings.json (pi-compatible patterns)", async () => {
   const { handlers } = await captureHandlers();
-  // The legacy model selector's global allowlist (settings.json `enabledModels`)
-  // has no UI or handler anymore; it must not cap the chat picker. Only the
-  // per-provider overlay in models.json filters models.
+  // `enabledModels` in the agent settings file is pi's native allowlist, which
+  // the pi CLI applies at startup. The desktop picker must scope models the
+  // same way so both surfaces agree on the usable models.
   const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
-  writeFileSync(settingsPath, JSON.stringify({ enabledModels: ["gemini-3.5-flash"] }, null, 2));
+  const detail = await handlers["modelsConfig.providerModels"]({ providerId: "openai" });
+  const firstId = detail.models[0].id;
   await handlers["auth.setApiKey"]({ provider: "openai", key: "secret" });
-  const listed = await handlers["models.list"]({ cwd: root });
-  const openaiModels = listed.models.filter((m) => m.provider === "openai");
-  assert.ok(openaiModels.length > 1, "global allowlist must not restrict openai models");
+  try {
+    writeFileSync(settingsPath, JSON.stringify({ enabledModels: [`openai/${firstId}`] }, null, 2));
+    const listed = await handlers["models.list"]({ cwd: root });
+    const openaiModels = listed.models.filter((m) => m.provider === "openai");
+    assert.deepEqual(
+      openaiModels.map((m) => m.id),
+      [firstId],
+      "canonical pattern must scope the picker",
+    );
+
+    // A bare glob matches every model, mirroring pi's resolver (provider/modelId
+    // OR bare modelId).
+    writeFileSync(settingsPath, JSON.stringify({ enabledModels: ["*"] }, null, 2));
+    const listedAll = await handlers["models.list"]({ cwd: root });
+    assert.ok(
+      listedAll.models.filter((m) => m.provider === "openai").length > 1,
+      "a catch-all pattern must not restrict models",
+    );
+  } finally {
+    rmSync(settingsPath, { force: true });
+    await handlers["auth.deleteApiKey"]({ provider: "openai" });
+  }
+});
+
+test("a hand-written partial enabledModels allowlist filters the picker without listing every provider", async () => {
+  const { handlers } = await captureHandlers();
+  const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
   rmSync(settingsPath, { force: true });
-  await handlers["auth.deleteApiKey"]({ provider: "openai" });
+  const detail = await handlers["modelsConfig.providerModels"]({ providerId: "openai" });
+  const firstId = detail.models[0].id;
+  // pi-style patterns written by hand (no desktop-owned map key): only the
+  // providers the allowlist mentions with a partial match may surface as
+  // "filtered" in the model panel. Unmentioned providers are NOT configured.
+  writeFileSync(
+    settingsPath,
+    JSON.stringify({ enabledModels: [`openai/${firstId}`, "google/**", "radius/**"] }, null, 2),
+  );
+  try {
+    const providers = await handlers["modelsConfig.providers"]();
+    const byId = new Map(providers.providers.map((p) => [p.id, p]));
+    assert.ok(byId.has("openai"), "openai is a built-in provider");
+    assert.deepEqual(
+      byId.get("openai").enabledModels,
+      [firstId],
+      "a mentioned provider with a partial match is filtered to the matching models",
+    );
+    // google/** matches every google model → no filter reported.
+    if (byId.has("google")) assert.equal(byId.get("google").enabledModels, undefined);
+    // Providers the allowlist never mentions must not look configured.
+    for (const id of ["anthropic", "amazon-bedrock", "groq"]) {
+      if (byId.has(id)) assert.equal(byId.get(id).enabledModels, undefined, `${id} must not look filtered`);
+    }
+  } finally {
+    rmSync(settingsPath, { force: true });
+  }
 });
 
 test("testProxyConnectivity probes through a working proxy and reports failures", async () => {

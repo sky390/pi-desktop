@@ -229,6 +229,63 @@ export function Select({
   );
 }
 
+/**
+ * Segmented button group for choosing one of a few short options (e.g. a
+ * boolean setting with an explicit "inherit" state), used instead of a
+ * dropdown when every option deserves a visible label.
+ */
+export function Selector<T extends string>({
+  value,
+  onChange,
+  options,
+  ariaLabel,
+}: {
+  value: T;
+  onChange: (v: T) => void;
+  options: readonly { value: T; label: string }[];
+  ariaLabel?: string;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label={ariaLabel}
+      style={{
+        display: "inline-flex",
+        border: "1px solid var(--border)",
+        borderRadius: 7,
+        overflow: "hidden",
+        minHeight: 32,
+        width: "fit-content",
+      }}
+    >
+      {options.map((option, index) => {
+        const active = value === option.value;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            onClick={() => onChange(option.value)}
+            aria-pressed={active}
+            style={{
+              border: "none",
+              borderRight: index < options.length - 1 ? "1px solid var(--border)" : "none",
+              background: active ? "var(--bg-selected)" : "none",
+              color: active ? "var(--text)" : "var(--text-muted)",
+              cursor: "pointer",
+              fontSize: 12,
+              fontWeight: active ? 600 : 400,
+              padding: "0 12px",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export function Check({
   label,
   checked,

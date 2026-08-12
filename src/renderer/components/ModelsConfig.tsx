@@ -1,5 +1,15 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Check, Field, NumInput, SecretTextInput, Select, SectionTitle, TextInput, inputStyle } from "./form-controls";
+import {
+  Check,
+  Field,
+  NumInput,
+  SecretTextInput,
+  SectionTitle,
+  Select,
+  Selector,
+  TextInput,
+  inputStyle,
+} from "./form-controls";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/i18n";
 import { replaceModelEntry, type ModelEntry, type ModelsJson, type ProviderEntry } from "@/lib/models-config-state";
@@ -888,6 +898,23 @@ function hasDeepseekCompat(model: ModelEntry): boolean {
   return model.compat?.thinkingFormat === "deepseek";
 }
 
+/** Current `compat.supportsDeveloperRole` value as a selector value ("" = unset/inherit). */
+function getDeveloperRole(model: ModelEntry): string {
+  const value = model.compat?.supportsDeveloperRole;
+  return value === undefined ? "" : String(value);
+}
+
+function setDeveloperRole(model: ModelEntry, value: string): ModelEntry {
+  if (value === "") {
+    if (!model.compat) return model;
+    const rest = { ...model.compat };
+    delete rest.supportsDeveloperRole;
+    return { ...model, compat: Object.keys(rest).length ? rest : undefined };
+  }
+  const supportsDeveloperRole = value === "true";
+  return { ...model, compat: { ...(model.compat ?? {}), supportsDeveloperRole } };
+}
+
 function setDeepseekCompat(model: ModelEntry, enabled: boolean): ModelEntry {
   if (enabled) {
     return { ...model, compat: { ...(model.compat ?? {}), ...DEEPSEEK_COMPAT } };
@@ -1084,6 +1111,19 @@ function ModelDetail({
 
       <Field label={t("apiOverride", "API override")}>
         <Select value={model.api ?? ""} onChange={(v) => set("api", v || undefined)} options={API_OPTIONS} />
+      </Field>
+
+      <Field label={t("supportsDeveloperRole", "Supports developer role")}>
+        <Selector
+          value={getDeveloperRole(model)}
+          onChange={(v) => onChange(setDeveloperRole(model, v))}
+          ariaLabel={t("supportsDeveloperRole", "Supports developer role")}
+          options={[
+            { value: "", label: t("developerRoleInherit", "Inherit") },
+            { value: "true", label: t("developerRoleSupported", "Supported") },
+            { value: "false", label: t("developerRoleNotSupported", "Not supported") },
+          ]}
+        />
       </Field>
 
       <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
@@ -2765,20 +2805,21 @@ export function ModelsConfig({
   }, [config, onChanged]);
 
   const providers = Object.entries(config.providers ?? {});
-  // Built-in provider overlays (Base URL / enabled models) are stored under the
-  // provider's id in models.json; they are managed by the "Providers" section
-  // above and must not be listed here as if they were user-created providers.
+  // Built-in provider overlays are managed by the "Providers" section above and
+  // must not be listed here as if they were user-created providers. The Base URL
+  // override lives in models.json; the enabled-model filter lives in the agent
+  // settings file (`enabledModels`, pi's native key — pi's CLI rejects
+  // `enabledModels` in models.json providers).
   const builtinIds = new Set(builtinProviders.map((p) => p.id));
   const customProviders = providers.filter(([name]) => !builtinIds.has(name));
   const activeOAuth = oauthProviders.filter((p) => p.loggedIn);
   const activeApiKey = apiKeyProviders.filter((p) => p.configured);
 
-  // Only show built-in providers that are actually usable (credentials present) or
-  // carry an existing overlay, so the model list stays focused instead of listing
-  // every built-in provider the user has never configured.
-  const visibleBuiltin = builtinProviders.filter(
-    (p) => p.configured || p.enabledModels !== undefined || p.customBaseUrl !== undefined,
-  );
+  // Only show built-in providers that are actually connected (usable
+  // credentials present). An unconnected built-in provider — even one carrying a
+  // leftover enabled-model filter or Base URL override from a previous session —
+  // must not clutter the list; it reappears as soon as the user connects it.
+  const visibleBuiltin = builtinProviders.filter((p) => p.configured);
 
   const renderBuiltinDetail = (providerId: string) => (
     <BuiltinProviderDetail
@@ -2788,16 +2829,19 @@ export function ModelsConfig({
         onChanged?.();
         loadBuiltinProviders();
       }}
-      onApplied={({ providerId: pid, baseUrl, enabledModels }) => {
-        // Keep the config snapshot in sync with auto-saved built-in overlays so
-        // a later full-config save cannot revert them to stale values.
+      onApplied={({ providerId: pid, baseUrl }) => {
+        // Keep the config snapshot in sync with auto-saved built-in Base URL
+        // overrides so a later full-config save cannot revert them. The
+        // enabled-model filter is NOT part of models.json (it lives in the
+        // agent settings file `enabledModels`, because pi's CLI rejects
+        // `enabledModels` in models.json provider entries), so it must not be
+        // mirrored here.
         setConfig((prev) => {
           const providers = { ...(prev.providers ?? {}) };
           const existing = { ...(providers[pid] ?? {}) };
+          delete existing.enabledModels;
           if (baseUrl) existing.baseUrl = baseUrl;
           else delete existing.baseUrl;
-          if (enabledModels === null) delete existing.enabledModels;
-          else existing.enabledModels = enabledModels;
           if (Object.keys(existing).length === 0) delete providers[pid];
           else providers[pid] = existing;
           return { ...prev, providers };

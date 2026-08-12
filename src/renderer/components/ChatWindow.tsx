@@ -589,15 +589,15 @@ export function ChatWindow({
                   alt=""
                   aria-hidden="true"
                   style={{
-                    width: 36,
-                    height: 36,
+                    width: 48,
+                    height: 48,
                     objectFit: "contain",
                     flexShrink: 0,
                   }}
                 />
                 <span
                   style={{
-                    fontSize: 26,
+                    fontSize: 30,
                     color: "var(--text)",
                     flexShrink: 0,
                     whiteSpace: "nowrap",

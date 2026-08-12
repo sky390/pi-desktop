@@ -11,7 +11,8 @@ const output = path.join(import.meta.dirname, "../../../.artifacts/test-modules"
 mkdirSync(path.dirname(output), { recursive: true });
 await build({
   stdin: {
-    contents: 'export { Check, Field, NumInput, SecretTextInput, Select, TextInput } from "./form-controls.tsx";',
+    contents:
+      'export { Check, Field, NumInput, SecretTextInput, Select, Selector, TextInput } from "./form-controls.tsx";',
     resolveDir: import.meta.dirname,
     sourcefile: "form-controls-test-entry.tsx",
     loader: "tsx",
@@ -25,7 +26,7 @@ await build({
   logLevel: "silent",
 });
 
-const { Check, Field, NumInput, SecretTextInput, Select, TextInput } = await import(
+const { Check, Field, NumInput, SecretTextInput, Select, Selector, TextInput } = await import(
   `${pathToFileURL(output).href}?v=${Date.now()}`
 );
 
@@ -44,6 +45,28 @@ test("Field associates its label with every shared input type", () => {
   assertFieldAssociation(SecretTextInput, { value: "secret", onChange() {} }, "input");
   assertFieldAssociation(NumInput, { value: "42", onChange() {} }, "input");
   assertFieldAssociation(Select, { value: "one", onChange() {}, options: ["one"] }, "select");
+});
+
+test("Selector renders a segmented group with a pressed state and no dropdown", () => {
+  const html = renderToStaticMarkup(
+    createElement(Selector, {
+      value: "true",
+      onChange() {},
+      ariaLabel: "Supports developer role",
+      options: [
+        { value: "", label: "Inherit" },
+        { value: "true", label: "Supported" },
+        { value: "false", label: "Not supported" },
+      ],
+    }),
+  );
+  assert.match(html, /role="group"/);
+  assert.match(html, /aria-label="Supports developer role"/);
+  assert.match(html, /aria-pressed="true"/);
+  assert.match(html, /Inherit/);
+  assert.match(html, /Supported/);
+  assert.match(html, /Not supported/);
+  assert.doesNotMatch(html, /<select/);
 });
 
 test("compact shared controls expose at least a 32px pointer target", () => {

@@ -11,3 +11,6 @@ temp/
 .artifacts/
 build/toolchains/.core-cache/
 build/toolchains/core/
+
+# Freebuff agent workspace state (never commit)
+.freebuff/

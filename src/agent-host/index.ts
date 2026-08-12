@@ -3,7 +3,7 @@
  * Runs pi-coding-agent in-process; serves Api/Streams over MessagePort.
  */
 import { createRpcServer } from "../contract/rpc";
-import { applySavedProxySettings, registerHandlers } from "./handlers";
+import { applySavedProxySettings, registerHandlers, runStartupMigrations } from "./handlers";
 import { startSessionWatcher } from "./session-watcher";
 import { toolchainRuntime } from "./toolchain-runtime";
 import type { ToolchainSnapshot } from "../shared/toolchains/types";
@@ -20,6 +20,14 @@ const restoreGitRunner = installToolchainGitRunner();
 // Restore persisted proxy settings before any model traffic can start, so the
 // configured proxy takes effect immediately after a restart.
 applySavedProxySettings();
+// One-time cleanup: older desktop versions wrote the "enabled models" filter
+// into models.json (which pi's CLI rejects) and a desktop sidecar file. Lift
+// any leftovers into the canonical files (the pi-native `enabledModels` mirror
+// in the agent settings file, and the desktop-owned per-provider map in
+// `~/.pi/desktop/settings.json`) so the user does not have to open the model
+// panel first, and so a concurrent `pi` CLI run sees the same models. Also
+// self-heals a mirror polluted with patterns for unconfigured providers.
+void runStartupMigrations();
 const stopHandlers = registerHandlers(server);
 const stopWatcher = startSessionWatcher(server);
 

@@ -32,6 +32,18 @@ import {
   type SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels, type AuthInteraction } from "@earendil-works/pi-ai";
+import {
+  getLegacyProviderModelFiltersPath,
+  patternMatchesModel,
+  readAgentSettingsModelFilterMap,
+  readDesktopModelFilterMap,
+  readEnabledModelPatterns,
+  readLegacyDesktopSettingsFilters,
+  readLegacyProviderModelFilters,
+  readProviderModelFilters,
+  repairEnabledModelsMirror,
+  writeProviderModelFilters,
+} from "./provider-model-filters";
 import type { RpcServer } from "../contract/rpc";
 import {
   RpcError,
@@ -511,6 +523,249 @@ function writeModelsJson(data: Record<string, unknown>): void {
   }
 }
 
+// ── Enabled-model filters (agent `enabledModels` + desktop map, NOT models.json) ──
+//
+// The desktop's "enabled models" selection lives in two places: pi's native
+// `enabledModels` patterns in `~/.pi/agent/settings.json` (the same setting
+// pi's CLI reads at startup to scope its available models), and the
+// desktop-owned per-provider map in `~/.pi/desktop/settings.json` (a file pi's
+// CLI never reads, so unknown-to-pi fields stay there). pi's CLI rejects
+// `enabledModels` inside models.json provider entries, so it must never be
+// written there. Older desktop versions wrote the filter into models.json and
+// a desktop sidecar file; the migrations below lift any leftovers into the
+// two canonical files. They are cheap and idempotent, so they run on every
+// read/write entry point and keep repairing old files even if the user
+// hand-edits them back.
+
+/**
+ * Every provider id pi can see: the built-in catalog plus any provider entry
+ * present in models.json (so `providerId/*` patterns never exclude custom
+ * providers the user configured).
+ */
+function knownProviderIds(): string[] {
+  const ids = new Set<string>();
+  for (const provider of builtinProviderCatalog.builtinProviders()) ids.add(provider.id);
+  try {
+    const config = readModelsJson();
+    for (const providerId of Object.keys((config.providers ?? {}) as Record<string, unknown>)) ids.add(providerId);
+  } catch {
+    // Corrupt models.json: built-in catalog only.
+  }
+  return [...ids];
+}
+
+/**
+ * Best-effort per-provider model id lists for pattern resolution: the built-in
+ * catalog, overridden by any `models` arrays in models.json. Never throws — a
+ * corrupt models.json falls back to the built-in catalog.
+ */
+function buildModelsByProvider(): Record<string, string[]> {
+  const result: Record<string, string[]> = {};
+  for (const provider of builtinProviderCatalog.builtinProviders()) {
+    result[provider.id] = provider.getModels().map((m) => m.id);
+  }
+  try {
+    const config = readModelsJson();
+    const providers = (config.providers ?? {}) as Record<string, { models?: unknown[] }>;
+    for (const [providerId, entry] of Object.entries(providers)) {
+      if (!entry || typeof entry !== "object" || !Array.isArray(entry.models)) continue;
+      const ids = entry.models
+        .map((m) =>
+          m && typeof m === "object" && typeof (m as { id?: unknown }).id === "string" ? (m as { id: string }).id : "",
+        )
+        .filter(Boolean);
+      if (ids.length > 0) result[providerId] = ids;
+    }
+  } catch {
+    // Corrupt models.json: built-in catalog only.
+  }
+  return result;
+}
+
+/**
+ * The providers pi actually resolves models for — the ones the shared model
+ * runtime reports as having usable auth (stored credential, models.json
+ * apiKey/headers, or an environment variable). pi scopes its model list to
+ * configured providers, so `enabledModels` patterns must only reference these:
+ * a pattern for an unconfigured provider matches nothing and makes pi warn
+ * "No models match pattern".
+ */
+async function resolvableProviderIds(): Promise<string[]> {
+  const runtime = await getSharedModelRuntime();
+  return knownProviderIds().filter((id) => runtime.getProviderAuthStatus(id)?.configured === true);
+}
+
+/**
+ * Lift any `enabledModels` an older desktop version wrote into models.json
+ * provider entries into the desktop-owned map (mirrored to the agent settings
+ * `enabledModels`), so pi's CLI never trips over them. A provider entry left
+ * with no pi-recognized fields at all would still fail pi's validation, so the
+ * whole entry is dropped.
+ */
+async function migrateLegacyEnabledModels(): Promise<boolean> {
+  let config: Record<string, unknown>;
+  try {
+    config = readModelsJson();
+  } catch {
+    // Corrupt models.json: leave it untouched (ISSUE-009) and retry on the next
+    // call once the user has fixed the file.
+    return false;
+  }
+  const providers = (config.providers ?? {}) as Record<string, Record<string, unknown>>;
+  const leftovers: Record<string, string[]> = {};
+  let dirty = false;
+  for (const [providerId, entry] of Object.entries(providers)) {
+    if (!entry || typeof entry !== "object" || !Array.isArray(entry.enabledModels)) continue;
+    leftovers[providerId] = entry.enabledModels.filter(
+      (v): v is string => typeof v === "string" && v.trim().length > 0,
+    );
+    delete entry.enabledModels;
+    // A provider entry that ends up with no pi-recognized fields at all would
+    // still fail pi's validation, so drop the whole entry.
+    if (Object.keys(entry).length === 0) delete providers[providerId];
+    dirty = true;
+  }
+  if (dirty) {
+    const filters = readProviderModelFilters(buildModelsByProvider());
+    for (const [providerId, ids] of Object.entries(leftovers)) {
+      if (!(providerId in filters)) filters[providerId] = ids;
+    }
+    writeProviderModelFilters(filters, await resolvableProviderIds());
+    writeModelsJson(config);
+  }
+  return dirty;
+}
+
+/**
+ * Lift the per-provider filter map from the legacy sidecar file
+ * (`<agent dir>/pi-desktop-provider-model-filters.json`) into the desktop
+ * settings file (mirrored to the agent settings `enabledModels`), then remove
+ * the legacy file. Idempotent: once the legacy file is gone nothing is left to
+ * migrate.
+ */
+export async function migrateLegacyProviderModelFilters(): Promise<boolean> {
+  const legacy = readLegacyProviderModelFilters();
+  if (legacy === undefined) return false;
+  const filters = readProviderModelFilters(buildModelsByProvider());
+  for (const [providerId, ids] of Object.entries(legacy)) {
+    if (!(providerId in filters)) filters[providerId] = ids;
+  }
+  writeProviderModelFilters(filters, await resolvableProviderIds());
+  try {
+    unlinkSync(getLegacyProviderModelFiltersPath());
+  } catch {
+    /* ignore cleanup failure */
+  }
+  return true;
+}
+
+/**
+ * Move the per-provider filter map a recent desktop version stored in the
+ * agent settings file under `piDesktopModelFilters` into the desktop settings
+ * file. The stored map is the user's explicit per-provider state, so its
+ * entries override any pattern-derived guess; a provider already present in an
+ * existing desktop map is newer state and is kept. The map is desktop-owned,
+ * so it never belonged in the agent settings file pi parses; the write also
+ * removes the leftover key from the agent settings file.
+ */
+export async function migrateLegacyAgentSettingsMap(): Promise<boolean> {
+  const legacy = readAgentSettingsModelFilterMap();
+  if (legacy === undefined) return false;
+  const desktopMap = readDesktopModelFilterMap();
+  const filters = readProviderModelFilters(buildModelsByProvider());
+  for (const [providerId, ids] of Object.entries(legacy)) {
+    if (desktopMap && providerId in desktopMap) continue;
+    filters[providerId] = ids;
+  }
+  writeProviderModelFilters(filters, await resolvableProviderIds());
+  return true;
+}
+
+/**
+ * Rename the per-provider filter map an intermediate desktop version stored in
+ * the desktop settings file under the legacy `providerModelFilters` key to the
+ * current `piDesktopModelFilters` key (merging any entries the current map
+ * lacks). The desktop settings file is the canonical home of the map, so it is
+ * kept — only the key name is fixed.
+ */
+export async function migrateLegacyDesktopSettingsFilters(): Promise<boolean> {
+  const legacy = readLegacyDesktopSettingsFilters();
+  if (legacy === undefined) return false;
+  const filters = readProviderModelFilters(buildModelsByProvider());
+  for (const [providerId, ids] of Object.entries(legacy)) {
+    if (!(providerId in filters)) filters[providerId] = ids;
+  }
+  writeProviderModelFilters(filters, await resolvableProviderIds());
+  return true;
+}
+
+/**
+ * Startup-time one-off cleanup: lift any legacy `enabledModels` an older
+ * desktop version wrote into models.json or a desktop sidecar file into the
+ * canonical files (agent `enabledModels` mirror + desktop-owned map), so pi's
+ * CLI and the desktop agree on the enabled models. Best-effort — failures are
+ * logged, never fatal.
+ */
+export async function runStartupMigrations(): Promise<void> {
+  // The agent-settings map must be moved before anything rewrites the agent
+  // settings file: `writeProviderModelFilters` self-heals by dropping the
+  // agent-side `piDesktopModelFilters` key it no longer owns.
+  try {
+    if (await migrateLegacyAgentSettingsMap()) {
+      console.log("[agent-host] moved piDesktopModelFilters from agent settings into desktop settings.json");
+    }
+  } catch (error) {
+    console.warn(
+      `[agent-host] failed to migrate agent-settings filter map: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    if (await migrateLegacyEnabledModels()) {
+      console.log("[agent-host] migrated legacy enabledModels from models.json into agent settings.json");
+    }
+  } catch (error) {
+    console.warn(
+      `[agent-host] failed to migrate legacy enabledModels: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // The desktop-key rename must run before the sidecar migration: both write
+  // the desktop settings file, and its self-heal drops the legacy
+  // `providerModelFilters` key — if the sidecar wrote first, the desktop-key
+  // migration would find nothing left to read.
+  try {
+    if (await migrateLegacyDesktopSettingsFilters()) {
+      console.log("[agent-host] renamed legacy desktop providerModelFilters key to piDesktopModelFilters");
+    }
+  } catch (error) {
+    console.warn(
+      `[agent-host] failed to migrate legacy desktop settings: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  try {
+    if (await migrateLegacyProviderModelFilters()) {
+      console.log("[agent-host] migrated legacy provider-model filter sidecar into desktop settings.json");
+    }
+  } catch (error) {
+    console.warn(
+      `[agent-host] failed to migrate legacy provider-model filter file: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // Self-heal: regenerate the mirror from the desktop-owned map (if any),
+  // restricted to providers pi actually resolves. An older desktop version
+  // wrote `providerId/**` for every built-in provider, so unconfigured ones
+  // polluted the mirror and pi warned "No models match pattern"; dropping
+  // them is safe because pi has no models for those providers anyway.
+  try {
+    if (repairEnabledModelsMirror(await resolvableProviderIds())) {
+      console.log("[agent-host] repaired enabledModels mirror (dropped patterns for unresolvable providers)");
+    }
+  } catch (error) {
+    console.warn(
+      `[agent-host] failed to repair enabledModels mirror: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
 // ── Built-in provider overlays (custom Base URL + enabled models) ────────────
 
 function getBuiltinProviderDefaults(): Map<
@@ -538,6 +793,7 @@ function getProviderOverlay(
   config: Record<string, unknown>,
   providerId: string,
   defaultBaseUrl: string,
+  modelIds: readonly string[],
 ): {
   customBaseUrl?: string;
   enabledModels?: string[];
@@ -547,9 +803,14 @@ function getProviderOverlay(
   const rawBaseUrl = typeof entry.baseUrl === "string" ? entry.baseUrl.trim() : "";
   // A Base URL identical to the official endpoint is not a customization.
   const customBaseUrl = rawBaseUrl && rawBaseUrl !== defaultBaseUrl ? rawBaseUrl : undefined;
-  const enabledModels = Array.isArray(entry.enabledModels)
-    ? entry.enabledModels.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
-    : undefined;
+  // The enabled-model filter never lives in models.json — pi's CLI rejects
+  // `enabledModels` in provider entries. It lives in the desktop's per-provider
+  // `piDesktopModelFilters` map (`~/.pi/desktop/settings.json`, desktop-owned)
+  // mirrored to pi's native `enabledModels` key (`~/.pi/agent/settings.json`).
+  // A provider the user never touched is absent from the map and stays omitted
+  // here, so the model panel does not list it as "configured".
+  const filters = readProviderModelFilters({ [providerId]: modelIds });
+  const enabledModels = providerId in filters ? filters[providerId] : undefined;
   return { customBaseUrl, enabledModels };
 }
 
@@ -672,45 +933,16 @@ function writeTextAtomically(filePath: string, content: string): void {
   }
 }
 
-const THINKING_SUFFIXES = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-
-function stripThinkingSuffix(modelRef: string): string {
-  const trimmed = modelRef.trim();
-  const colonIndex = trimmed.lastIndexOf(":");
-  if (colonIndex === -1) return trimmed;
-  const suffix = trimmed.substring(colonIndex + 1);
-  return THINKING_SUFFIXES.has(suffix) ? trimmed.substring(0, colonIndex) : trimmed;
-}
-
 /**
- * Per-provider enabled model ids persisted in models.json (`providers.<id>.enabledModels`).
- * Unlike the global settings allowlist this filter is authoritative: disabling every
- * model of a provider removes that provider from the chat model picker.
+ * Filter the chat model picker by the `enabledModels` patterns in the agent
+ * settings file — the same allowlist pi's CLI applies at startup, so the
+ * desktop picker and pi agree on which models are usable. `undefined` (no
+ * key) means every model is usable; an empty array disables everything.
  */
-function filterByProviderEnabledModels<T extends { id: string; provider: string }>(
-  available: T[],
-  config: Record<string, unknown> | undefined,
-): T[] {
-  const providers = (config?.providers ?? {}) as Record<string, { enabledModels?: unknown }>;
-  const byProvider = new Map<string, Set<string>>();
-  for (const [providerId, entry] of Object.entries(providers)) {
-    // Absent → no filter (all models). An empty array is explicit: disable every model.
-    if (!Array.isArray(entry?.enabledModels)) continue;
-    const ids = new Set<string>();
-    for (const ref of entry.enabledModels) {
-      if (typeof ref === "string") {
-        const stripped = stripThinkingSuffix(ref);
-        if (stripped) ids.add(stripped);
-      }
-    }
-    byProvider.set(providerId, ids);
-  }
-  if (byProvider.size === 0) return available;
-  return available.filter((m) => {
-    const ids = byProvider.get(m.provider);
-    if (!ids) return true;
-    return ids.has(m.id) || ids.has(`${m.provider}/${m.id}`);
-  });
+function filterByEnabledModelPatterns<T extends { id: string; provider: string }>(available: T[]): T[] {
+  const patterns = readEnabledModelPatterns();
+  if (patterns === undefined) return available;
+  return available.filter((m) => patterns.some((pattern) => patternMatchesModel(pattern, m.provider, m.id)));
 }
 
 export async function credentialMutationFailure(
@@ -749,17 +981,19 @@ async function projectModelsList(
   catalog: ModelCatalogStatus,
 ): Promise<ModelsListResult> {
   const available = [...(await modelRuntime.getAvailable())];
-  let modelsConfig: Record<string, unknown> | undefined;
+  // Lift any `enabledModels` left in models.json by older desktop versions into
+  // the agent settings file; a corrupt models.json is left untouched (see ISSUE-009).
+  await migrateLegacyEnabledModels();
+  // Self-heal the mirror (drop patterns for unconfigured providers) so the
+  // picker and pi CLI agree without requiring a restart.
   try {
-    modelsConfig = readModelsJson();
+    repairEnabledModelsMirror(await resolvableProviderIds());
   } catch {
-    // A corrupt models.json must not break model listing; the editor surfaces the parse error.
-    modelsConfig = undefined;
+    // Runtime unavailable — picker keeps the stored patterns as-is.
   }
-  // The global `enabledModels` allowlist (settings.json) had its only UI and
-  // handler removed with the legacy model selector, so it must not cap the chat
-  // picker invisibly. The per-provider overlay in models.json is authoritative.
-  const visible = filterByProviderEnabledModels(available, modelsConfig);
+  // The chat picker honors the same `enabledModels` allowlist pi's CLI applies
+  // at startup (agent settings.json), so both surfaces agree on the models.
+  const visible = filterByEnabledModelPatterns(available);
   const models = visible
     .map((model) => ({ id: model.id, name: model.name, provider: model.provider }))
     .sort((a, b) => a.name.localeCompare(b.name) || a.provider.localeCompare(b.provider));
@@ -1558,15 +1792,43 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       return { ok: true as const, cancelled: modelCatalogRefreshCoordinator.cancel(requestId) };
     },
 
-    "modelsConfig.get": () => readModelsJson() as never,
+    "modelsConfig.get": async () => {
+      // Lift legacy `providers.<id>.enabledModels` out of models.json so the
+      // editor snapshot never re-saves the desktop-only field into pi's config.
+      await migrateLegacyEnabledModels();
+      return readModelsJson() as never;
+    },
     "modelsConfig.set": async (params) => {
       const body = params as Record<string, unknown>;
       // ISSUE-009: refuse to persist empty overwrite without explicit providers key from a real load
       if (!body || typeof body !== "object" || !("providers" in body)) {
         throw new RpcError({ code: "BAD_REQUEST", message: "Invalid models config payload" });
       }
+      await migrateLegacyEnabledModels();
+      // A full-config save must never write the enabled-model filter into
+      // models.json; lift any leftovers into the agent settings file instead.
+      const providers = (body.providers ?? {}) as Record<string, Record<string, unknown>>;
+      let filtersChanged = false;
+      const filters = readProviderModelFilters(buildModelsByProvider());
+      for (const [providerId, entry] of Object.entries(providers)) {
+        if (!entry || typeof entry !== "object" || !Array.isArray(entry.enabledModels)) continue;
+        if (!(providerId in filters)) {
+          filters[providerId] = entry.enabledModels.filter(
+            (v): v is string => typeof v === "string" && v.trim().length > 0,
+          );
+        }
+        delete entry.enabledModels;
+        // Drop entries that would be left with no pi-recognized fields (pi's CLI
+        // rejects provider entries without baseUrl/headers/models/...).
+        if (Object.keys(entry).length === 0) delete providers[providerId];
+        filtersChanged = true;
+      }
+      // Persist models.json first, then reload the runtime so resolvable
+      // provider ids reflect the newly saved config (e.g. a provider the user
+      // just gave an apiKey), then write the mirror restricted to those.
       writeModelsJson(body);
       await reloadSharedModelRuntimeConfig();
+      if (filtersChanged) writeProviderModelFilters(filters, await resolvableProviderIds());
       return { ok: true as const };
     },
     "networkProxy.get": () => {
@@ -1724,9 +1986,15 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       const runtime = await getSharedModelRuntime();
       const result = [...defaults.values()]
         .map((defaultProvider) => {
-          const overlay = getProviderOverlay(config, defaultProvider.id, defaultProvider.baseUrl);
           const composed = runtime.getProvider(defaultProvider.id);
-          const modelCount = (composed?.getModels() ?? defaultProvider.getModels()).length;
+          const models = composed?.getModels() ?? defaultProvider.getModels();
+          const overlay = getProviderOverlay(
+            config,
+            defaultProvider.id,
+            defaultProvider.baseUrl,
+            models.map((m) => m.id),
+          );
+          const modelCount = models.length;
           const auth = runtime.getProviderAuthStatus(defaultProvider.id);
           return {
             id: defaultProvider.id,
@@ -1755,10 +2023,15 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         throw new RpcError({ code: "NOT_FOUND", message: `Unknown built-in provider: ${id}` });
       }
       const config = readModelsJson();
-      const overlay = getProviderOverlay(config, id, defaultProvider.baseUrl);
       const runtime = await getSharedModelRuntime();
       const composed = runtime.getProvider(id);
       const models = (composed?.getModels() ?? defaultProvider.getModels()).map((m) => ({ id: m.id, name: m.name }));
+      const overlay = getProviderOverlay(
+        config,
+        id,
+        defaultProvider.baseUrl,
+        models.map((m) => m.id),
+      );
       return {
         provider: {
           id: defaultProvider.id,
@@ -1774,7 +2047,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
     },
 
     "modelsConfig.setProviderOverlay": async (params) => {
-      const body = params as { providerId?: string; baseUrl?: string; enabledModels?: string[] };
+      const body = params as { providerId?: string; baseUrl?: string; enabledModels?: string[] | null };
       const providerId = typeof body.providerId === "string" ? body.providerId.trim() : "";
       if (!providerId) throw new RpcError({ code: "BAD_REQUEST", message: "providerId is required" });
       const defaults = getBuiltinProviderDefaults();
@@ -1782,9 +2055,17 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       if (!defaultProvider) {
         throw new RpcError({ code: "NOT_FOUND", message: `Unknown built-in provider: ${providerId}` });
       }
+
+      // The Base URL override belongs in models.json (pi owns that file); the
+      // enabled-model filter must NOT go there — pi's CLI rejects `enabledModels`
+      // in provider entries, so it is persisted in the agent settings file under
+      // pi's native `enabledModels` key.
       const config = readModelsJson();
       const providers = (config.providers ?? {}) as Record<string, Record<string, unknown>>;
       const next = { ...(providers[providerId] ?? {}) };
+      // Never persist the enabled-model filter into models.json, even if a stale
+      // entry was left there by an older desktop version.
+      delete next.enabledModels;
 
       if (body.baseUrl !== undefined) {
         const trimmed = body.baseUrl.trim();
@@ -1792,27 +2073,34 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         else delete next.baseUrl;
       }
       if (body.enabledModels !== undefined) {
+        // Merge into the current per-provider state (the desktop's stored map,
+        // or the map derived from hand-written `enabledModels` patterns) so
+        // toggling one provider never drops another's.
+        const providerIds = await resolvableProviderIds();
+        const modelsByProvider: Record<string, string[]> = buildModelsByProvider();
+        try {
+          const runtime = await getSharedModelRuntime();
+          for (const pid of knownProviderIds()) {
+            const composed = runtime.getProvider(pid);
+            const models = composed?.getModels() ?? defaults.get(pid)?.getModels() ?? [];
+            modelsByProvider[pid] = models.map((m) => m.id);
+          }
+        } catch {
+          // Fall back to the synchronous catalog view on runtime failure.
+        }
+        const filters = readProviderModelFilters(modelsByProvider);
         if (body.enabledModels === null) {
-          delete next.enabledModels;
+          delete filters[providerId];
         } else {
           const list = [...new Set(body.enabledModels.map((m) => m.trim()).filter(Boolean))];
           // Empty array is explicit: disable every model (absent means all enabled).
-          next.enabledModels = list;
+          filters[providerId] = list;
         }
+        writeProviderModelFilters(filters, providerIds);
       }
 
-      // pi-ai validates provider entries and rejects a config with no meaningful
-      // fields; `enabledModels` alone is not one of them. Anchor with the default
-      // Base URL (a no-op override) so a model-only toggle still loads.
-      const meaningful = Object.keys(next).filter((k) => k !== "enabledModels");
-      if (Object.keys(next).length > 0 && meaningful.length === 0) {
-        next.baseUrl = defaultProvider.baseUrl;
-      }
-      // Drop empty entries and entries that only anchor the default Base URL.
-      if (
-        Object.keys(next).length === 0 ||
-        (Object.keys(next).length === 1 && next.baseUrl === defaultProvider.baseUrl)
-      ) {
+      // Drop empty entries (no Base URL override left).
+      if (Object.keys(next).length === 0) {
         delete providers[providerId];
       } else {
         providers[providerId] = next;

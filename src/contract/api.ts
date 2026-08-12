@@ -271,7 +271,7 @@ export interface Api {
   "modelsConfig.providers": { params: void; result: { providers: BuiltinProviderInfo[] } };
   /** Full model list + overlay for one built-in provider. */
   "modelsConfig.providerModels": { params: { providerId: string }; result: ProviderModelsResult };
-  /** Persist custom Base URL / enabled models for a built-in provider. */
+  /** Persist custom Base URL (models.json) / enabled models (agent settings.json `enabledModels`) for a built-in provider. */
   "modelsConfig.setProviderOverlay": {
     // `enabledModels: null` clears the filter (every model enabled).
     params: { providerId: string; baseUrl?: string; enabledModels?: string[] | null };
