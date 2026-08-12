@@ -1,7 +1,7 @@
 # Pi Agent Desktop v2 — pure Electron (no Next sidecar, no bundled Node)
-appId: app.dlyzzt.pi-agent-desktop
+appId: app.sky390.pi-agent-desktop
 productName: Pi Agent Desktop
-copyright: Copyright © DLYZZT
+copyright: Copyright © DLYZZT · Modified by Sky390
 
 directories:
   output: dist

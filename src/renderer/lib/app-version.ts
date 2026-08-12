@@ -13,5 +13,5 @@ export const PI_VERSION =
   "unknown";
 
 export const APP_DISPLAY_NAME = "Pi Agent Desktop";
-export const APP_AUTHOR = "DLYZZT";
-export const APP_GITHUB_URL = "https://github.com/DLYZZT/pi-desktop";
+export const APP_AUTHOR = "DLYZZT (Modified by Sky390)";
+export const APP_GITHUB_URL = "https://github.com/sky390/pi-desktop";

@@ -8,7 +8,9 @@
 
 本地优先 · 零本地服务器 · 跨平台应用
 
-[![Desktop Build](https://github.com/DLYZZT/pi-desktop/actions/workflows/build-desktop.yml/badge.svg)](https://github.com/DLYZZT/pi-desktop/actions/workflows/build-desktop.yml)
+> 本仓库是 [DLYZZT/pi-desktop](https://github.com/DLYZZT/pi-desktop) 的 fork，由 Sky390 修改维护（Modified by Sky390）。
+
+[![Desktop Build](https://github.com/sky390/pi-desktop/actions/workflows/build-desktop.yml/badge.svg)](https://github.com/sky390/pi-desktop/actions/workflows/build-desktop.yml)
 ![Electron 43](https://img.shields.io/badge/Electron-43-47848F?logo=electron&logoColor=white)
 ![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=0B1F2A)
 ![macOS, Windows & Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
@@ -16,7 +18,7 @@
 
 [English](./README.en.md) · **简体中文**
 
-[下载 v0.1.7](https://github.com/DLYZZT/pi-desktop/releases/tag/v0.1.7) · [截图](#应用截图) · [功能](#核心能力) · [快速开始](#快速开始) · [架构](#架构设计) · [变更记录](https://github.com/DLYZZT/pi-desktop/releases) · [路线图](#路线图)
+[下载 v0.1.8](https://github.com/sky390/pi-desktop/releases/tag/v0.1.8) · [截图](#应用截图) · [功能](#核心能力) · [快速开始](#快速开始) · [架构](#架构设计) · [变更记录](https://github.com/sky390/pi-desktop/releases) · [路线图](#路线图)
 
 </div>
 
@@ -105,9 +107,9 @@
 
 ### 使用桌面安装包
 
-最新稳定版为 [v0.1.7](https://github.com/DLYZZT/pi-desktop/releases/tag/v0.1.7)，提供 macOS Apple Silicon / Intel、Windows x64 和 Linux x64 安装包。
+最新稳定版为 [v0.1.8](https://github.com/sky390/pi-desktop/releases/tag/v0.1.8)，提供 macOS Apple Silicon / Intel、Windows x64 和 Linux x64 安装包。
 
-Pi Agent Desktop v0.1.7 已内置 Pi Coding Agent 0.84.0 运行时。普通用户使用 Agent 本身无需单独安装 Pi CLI、Pi Coding Agent、Node.js 或 npm；安装桌面应用并配置模型提供商后即可使用。Skills、Plugins 或 Agent 脚本需要额外开发工具时，应用会优先复用健康的系统安装，也可以在用户确认后安装应用私有运行时。
+Pi Agent Desktop v0.1.8 已内置 Pi Coding Agent 0.84.0 运行时。普通用户使用 Agent 本身无需单独安装 Pi CLI、Pi Coding Agent、Node.js 或 npm；安装桌面应用并配置模型提供商后即可使用。Skills、Plugins 或 Agent 脚本需要额外开发工具时，应用会优先复用健康的系统安装，也可以在用户确认后安装应用私有运行时。
 
 应用会读取 `~/.pi/agent/` 中的会话与配置。如果你已经使用 Pi CLI，可以直接复用现有数据，无需迁移；此前没有使用过 Pi CLI 也不影响使用。
 
@@ -129,7 +131,7 @@ Pi Desktop 会先发现并验证用户已经安装的 Node.js/npm、Python、Git
 ### 本地运行
 
 ```bash
-git clone https://github.com/DLYZZT/pi-desktop.git
+git clone https://github.com/sky390/pi-desktop.git
 cd pi-desktop
 npm ci
 npm run dev
@@ -210,7 +212,7 @@ src/
 └── shared/        # 可测试的纯函数与共享模块
 ```
 
-欢迎通过 [Issues](https://github.com/DLYZZT/pi-desktop/issues) 提交问题或建议，也欢迎直接发起 Pull Request。提交代码前请至少运行：
+欢迎通过 [Issues](https://github.com/sky390/pi-desktop/issues) 提交问题或建议，也欢迎直接发起 Pull Request。提交代码前请至少运行：
 
 ```bash
 npm run verify

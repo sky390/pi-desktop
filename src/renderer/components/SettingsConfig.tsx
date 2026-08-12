@@ -395,7 +395,7 @@ function AboutSettings({ onClose }: { onClose: () => void }) {
                     textAlign: "right",
                   }}
                 >
-                  github.com/DLYZZT/pi-desktop ↗
+                  github.com/sky390/pi-desktop ↗
                 </button>
               }
               last
