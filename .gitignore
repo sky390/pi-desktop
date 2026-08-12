@@ -14,3 +14,6 @@ build/toolchains/core/
 
 # Freebuff agent workspace state (never commit)
 .freebuff/
+
+# Local AI session handoff file (never commit)
+CONTEXT.md
