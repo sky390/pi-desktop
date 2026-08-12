@@ -81,7 +81,9 @@ jobs:
 
   package:
     name: ${{ matrix.name }}
-    if: github.ref_type != 'tag' && github.event_name != 'push'
+    # Every non-tag trigger (push to main, PR, manual dispatch) produces
+    # unsigned installers; tagged runs build and verify via the release-* jobs.
+    if: github.ref_type != 'tag'
     needs: [quality, test-platforms]
     strategy:
       fail-fast: false
@@ -257,13 +259,15 @@ jobs:
         run: npm run check:toolchain-catalog:upstream
 
   release-macos:
-    name: Sign and notarize macOS
+    name: Build macOS (notarized when credentials available)
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: [release-contract]
     runs-on: macos-15
     timeout-minutes: 90
     environment:
       name: release
+    outputs:
+      mode: ${{ steps.signing.outputs.mode }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -277,7 +281,28 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Without Developer ID / notarization secrets the release degrades
+      # gracefully to unsigned macOS packages instead of failing the run.
+      - name: Detect signing and notarization credentials
+        id: signing
+        shell: bash
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -n "$MAC_CSC_LINK" ] && [ -n "$MAC_CSC_KEY_PASSWORD" ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+            echo "Signing and notarization credentials found; producing signed macOS packages"
+          else
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "No signing/notarization credentials; producing unsigned macOS packages"
+          fi
+
       - name: Build, sign, and notarize macOS
+        if: steps.signing.outputs.mode == 'signed'
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
@@ -286,7 +311,17 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npm run dist:mac:notarized -- --arm64 --x64
 
+      - name: Build unsigned macOS packages
+        if: steps.signing.outputs.mode == 'unsigned'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm run build
+          npm run prepare:bundled-tools -- --target darwin-arm64 --target darwin-x64
+          npx electron-builder --mac dmg zip --arm64 --x64 --publish never
+
       - name: Verify both signed and notarized apps
+        if: steps.signing.outputs.mode == 'signed'
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         shell: bash
@@ -457,7 +492,7 @@ jobs:
       - name: Run packaged toolchain E2E for macOS arm64
         run: npm run check:packaged-toolchains -- darwin-arm64
 
-      - name: Upload signed and notarized macOS artifacts
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
         with:
           name: pi-desktop-macos-release
@@ -470,7 +505,7 @@ jobs:
           retention-days: 14
 
   verify-macos-x64:
-    name: Verify signed macOS x64 package
+    name: Verify macOS x64 package
     if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: [release-macos]
     runs-on: macos-15-intel
@@ -488,13 +523,13 @@ jobs:
       - name: Install verification dependencies
         run: npm ci --ignore-scripts
 
-      - name: Download signed and notarized macOS artifacts
+      - name: Download macOS artifacts
         uses: actions/download-artifact@v8
         with:
           name: pi-desktop-macos-release
           path: dist
 
-      - name: Extract signed macOS x64 application
+      - name: Extract macOS x64 application
         shell: bash
         run: |
           set -euo pipefail
@@ -505,6 +540,7 @@ jobs:
           ditto -x -k "$archive" dist/mac-x64
 
       - name: Verify signed and notarized macOS x64 application
+        if: needs.release-macos.outputs.mode == 'signed'
         shell: bash
         run: |
           set -euo pipefail
