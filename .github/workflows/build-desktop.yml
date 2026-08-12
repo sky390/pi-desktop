@@ -81,9 +81,7 @@ jobs:
 
   package:
     name: ${{ matrix.name }}
-    # Every non-tag trigger (push to main, PR, manual dispatch) produces
-    # unsigned installers; tagged runs build and verify via the release-* jobs.
-    if: github.ref_type != 'tag'
+    if: github.ref_type != 'tag' && github.event_name != 'push'
     needs: [quality, test-platforms]
     strategy:
       fail-fast: false
