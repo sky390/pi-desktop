@@ -161,6 +161,6 @@ protocols:
 
 publish:
   provider: github
-  owner: DLYZZT
+  owner: sky390
   repo: pi-desktop
   releaseType: draft
