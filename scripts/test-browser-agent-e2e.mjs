@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -24,7 +25,8 @@ function build(entry, outfile, format, externals) {
       ...externals.map((external) => `--external:${external}`),
       `--outfile=${outfile}`,
     ],
-    { cwd: root, stdio: "inherit" },
+    // .cmd shims are not directly spawnable on Windows (spawn EINVAL).
+    { cwd: root, stdio: "inherit", shell: process.platform === "win32" },
   );
   if (result.status !== 0) throw new Error(`esbuild failed for ${entry}`);
 }
@@ -54,6 +56,8 @@ try {
       ELECTRON_DISABLE_SECURITY_WARNINGS: "true",
       PI_BROWSER_AGENT_E2E_HOST_ENTRY: hostOutfile,
     },
+    // .cmd shims are not directly spawnable on Windows (spawn EINVAL).
+    shell: process.platform === "win32",
   });
   const status = await new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -71,6 +75,18 @@ try {
       resolve(code ?? 1);
     });
   });
+  // The harness holds Windows handles on its workspace until exit; clean up
+  // only after the process is gone.
+  try {
+    const tempRoot = os.tmpdir();
+    for (const entry of fs.readdirSync(tempRoot)) {
+      if (entry.startsWith("pi-browser-agent-e2e-")) {
+        fs.rmSync(path.join(tempRoot, entry), { recursive: true, force: true });
+      }
+    }
+  } catch {
+    /* best effort */
+  }
   process.exitCode = status;
 } catch (error) {
   console.error(error);

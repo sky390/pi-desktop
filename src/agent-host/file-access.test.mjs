@@ -77,6 +77,10 @@ test("supports UNC roots without accepting a sibling share prefix", () => {
 
 test("rejects unrelated relative and mixed-style paths", () => {
   assert.equal(isFilePathAllowed("relative/file.txt", new Set(["/definitely/not/the/current/directory"])), false);
-  assert.equal(isFilePathAllowed("/tmp/project/file.txt", new Set(["C:\\tmp\\project"])), false);
+  // On Windows, "/tmp/project/file.txt" is drive-relative and genuinely lives
+  // inside the C:\\tmp\\project root, so the mixed-style rejection is POSIX-only.
+  if (process.platform !== "win32") {
+    assert.equal(isFilePathAllowed("/tmp/project/file.txt", new Set(["C:\\tmp\\project"])), false);
+  }
   assert.equal(isFilePathAllowed("/tmp/project/file.txt", new Set()), false);
 });

@@ -1,6 +1,6 @@
 import { execFile } from "child_process";
 import { existsSync, mkdirSync, realpathSync } from "fs";
-import { basename, dirname, join, resolve } from "path";
+import { basename, dirname, join, normalize, resolve } from "path";
 import { promisify } from "util";
 import { allowFileRoot } from "./allowed-roots.ts";
 import type { GitStatusResult } from "./api-types";
@@ -8,6 +8,22 @@ import { parseGitStatusPorcelain } from "./git-status.ts";
 export { parseGitStatusPorcelain } from "./git-status.ts";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Git prints absolute paths with forward slashes even on Windows, while the
+ * rest of the app uses native backslash paths. Normalize to native form so
+ * porcelain output round-trips through strict comparisons.
+ */
+function normalizeGitPath(filePath: string): string {
+  return normalize(filePath);
+}
+
+/** Compare absolute paths robustly (case- and separator-insensitive on Windows). */
+function samePath(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (process.platform !== "win32") return false;
+  return resolve(a).toLowerCase() === resolve(b).toLowerCase();
+}
 
 export interface GitCommandRunOptions {
   timeout: number;
@@ -188,10 +204,10 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
     // cwd is a subdirectory of a repo keeps its own project identity —
     // grouping subdirs under the repo root would change where new sessions
     // are created for existing users.
-    const isTopLevel = toplevel === realCwd;
+    const isTopLevel = samePath(toplevel, realCwd);
     const isWorktreeTopLevel = gitDir !== commonDir && isTopLevel;
     info = {
-      projectRoot: isWorktreeTopLevel ? dirname(commonDir) : cwd,
+      projectRoot: isWorktreeTopLevel ? normalizeGitPath(dirname(commonDir)) : cwd,
       branch: ref && ref !== "HEAD" ? ref : null,
       isWorktree: isWorktreeTopLevel,
       isTopLevel,
@@ -230,7 +246,7 @@ export async function listWorktrees(cwd: string): Promise<WorktreeInfo[]> {
       // not marked them prunable yet.
       if (!current.prunable && existsSync(current.path)) {
         worktrees.push({
-          path: current.path,
+          path: normalizeGitPath(current.path),
           branch: current.branch ?? null,
           isMain: worktrees.length === 0,
         });
@@ -303,7 +319,7 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
 
 export async function removeWorktree(cwd: string, worktreePath: string, force = false): Promise<void> {
   const worktrees = await listWorktrees(cwd);
-  const target = worktrees.find((w) => w.path === worktreePath);
+  const target = worktrees.find((w) => samePath(w.path, worktreePath));
   if (!target) throw new Error(`Not a worktree of this repository: ${worktreePath}`);
   if (target.isMain) throw new Error("Cannot remove the main worktree");
 

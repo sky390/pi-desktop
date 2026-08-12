@@ -126,7 +126,14 @@ async function finish(exitCode: number, error?: unknown): Promise<void> {
   await closeFixtureServer().catch(() => undefined);
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
   mainWindow = null;
-  fs.rmSync(root, { recursive: true, force: true });
+  try {
+    // Windows keeps handles on the workspace until this process exits, so
+    // removal may EPERM here; scripts/test-browser-agent-e2e.mjs cleans up
+    // after the process is gone.
+    fs.rmSync(root, { recursive: true, force: true });
+  } catch {
+    /* best effort */
+  }
   app.exit(exitCode);
 }
 

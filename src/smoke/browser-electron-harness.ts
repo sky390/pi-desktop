@@ -1710,7 +1710,14 @@ void app.whenReady().then(async () => {
     await new Promise<void>((resolve) => corsServer?.close(() => resolve()) ?? resolve());
     await new Promise<void>((resolve) => secureServer?.close(() => resolve()) ?? resolve());
     await new Promise<void>((resolve) => proxyServer?.close(() => resolve()) ?? resolve());
-    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      // Windows keeps handles on the workspace until this process exits, so
+      // removal may EPERM here; scripts/test-browser-electron.mjs cleans up
+      // after the process is gone.
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
     app.exit(0);
   } catch (error) {
     console.error(error instanceof Error ? (error.stack ?? error.message) : error);
@@ -1724,7 +1731,11 @@ void app.whenReady().then(async () => {
     corsServer?.close();
     secureServer?.close();
     proxyServer?.close();
-    fs.rmSync(root, { recursive: true, force: true });
+    try {
+      fs.rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
     app.exit(1);
   }
 });
