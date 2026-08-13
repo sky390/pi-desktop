@@ -275,6 +275,7 @@ export function ChatWindow({
     hasOlder,
     loadingOlder,
     notices,
+    dismissNotice,
     extensionDialog,
     extensionCustomUi,
     extensionStatuses,
@@ -607,7 +608,7 @@ export function ChatWindow({
                 </span>
               </div>
             </div>
-            <NoticeShelf notices={notices} align="right" />
+            <NoticeShelf notices={notices} align="right" onDismiss={dismissNotice} />
           </div>
         </div>
       ) : (
@@ -625,7 +626,7 @@ export function ChatWindow({
               }}
             >
               <div style={{ maxWidth: "var(--chat-content-max-width)", margin: "0 auto" }}>
-                <NoticeShelf notices={notices} floating align="right" />
+                <NoticeShelf notices={notices} floating align="right" onDismiss={dismissNotice} />
               </div>
             </div>
             <div ref={scrollContainerRef} className="relative z-[1] flex-1 overflow-y-auto pt-4 [scrollbar-width:none]">
@@ -1061,10 +1062,12 @@ function NoticeShelf({
   notices,
   floating = false,
   align = "left",
+  onDismiss,
 }: {
   notices: NoticeItem[];
   floating?: boolean;
   align?: "left" | "right";
+  onDismiss?: (id: string) => void;
 }) {
   if (notices.length === 0) return null;
   return (
@@ -1074,6 +1077,7 @@ function NoticeShelf({
         flexDirection: "column",
         alignItems: align === "right" ? "flex-end" : "stretch",
         marginBottom: floating ? 0 : 10,
+        pointerEvents: "auto",
       }}
     >
       {notices.map((notice, index) => {
@@ -1107,7 +1111,7 @@ function NoticeShelf({
                 : "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
               fontSize: 13,
               lineHeight: 1.5,
-              maxHeight: 320,
+              maxHeight: "min(60vh, 520px)",
               transformOrigin: "top center",
               animation: notice.exiting
                 ? "notice-shelf-out 0.18s ease-in forwards"
@@ -1138,6 +1142,29 @@ function NoticeShelf({
             >
               {notice.message}
             </span>
+            {onDismiss && (
+              <button
+                type="button"
+                title="Dismiss"
+                aria-label="Dismiss"
+                onClick={() => onDismiss(notice.id)}
+                style={{
+                  alignSelf: "flex-start",
+                  marginTop: 8,
+                  padding: "2px 6px",
+                  borderRadius: 6,
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--text-dim)",
+                  cursor: "pointer",
+                  fontSize: 13,
+                  lineHeight: 1,
+                  flexShrink: 0,
+                }}
+              >
+                {"×"}
+              </button>
+            )}
           </div>
         );
       })}

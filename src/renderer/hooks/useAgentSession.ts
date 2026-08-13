@@ -166,7 +166,7 @@ const INITIAL_HISTORY_TURNS = 20;
 const HISTORY_PAGE_MAX_BYTES = 1024 * 1024;
 const DEFERRED_CONTENT_CACHE_SIZE = 12;
 const MAX_NOTICES = 5;
-const NOTICE_VISIBLE_MS = 5000;
+const NOTICE_VISIBLE_MS = 10000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
 
@@ -2007,6 +2007,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     loadingOlder,
     historyRevision,
     notices: noticeState.visible,
+    dismissNotice: (id: string) => dispatchNotice({ type: "remove", id }),
     extensionDialog,
     extensionCustomUi,
     extensionStatuses,
