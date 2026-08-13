@@ -56,6 +56,25 @@ type ActiveCustomUi = {
   settled: boolean;
 };
 
+type ActiveWidget = {
+  render: (width: number) => string[];
+  dispose?: () => void;
+  width: number;
+};
+
+/**
+ * Minimal theme handed to extension widget factories. Desktop UI renders the
+ * produced text lines without ANSI styling, so color methods are no-ops that
+ * return the text unchanged. Covers the methods used by common extensions
+ * (e.g. rpiv-todo uses fg/bold/strikethrough).
+ */
+const MINIMAL_WIDGET_THEME = {
+  fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+  strikethrough: (text: string) => text,
+};
+
 type ExtensionUiRequestBody = Record<string, unknown> & {
   method: ExtensionUiRequest["method"];
   timeout?: number;
@@ -134,6 +153,7 @@ export class AgentSessionWrapper {
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
+  private activeWidgets = new Map<string, ActiveWidget>();
   private extensionStatuses = new Map<string, string>();
   private runtimeDiagnosticStatuses = new Map<string, string>();
   private extensionWidgets = new Map<string, ExtensionWidgetItem>();
@@ -435,7 +455,7 @@ export class AgentSessionWrapper {
   private async reloadSessionResources(): Promise<void> {
     await this.waitForExtensionsBound();
     this.extensionStatuses.clear();
-    this.extensionWidgets.clear();
+    this.disposeAllWidgets();
     await this.inner.reload();
     if (typeof this.inner.bindExtensions !== "function") {
       this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
@@ -766,6 +786,7 @@ export class AgentSessionWrapper {
     this.unsubscribe = null;
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
     for (const id of Array.from(this.activeCustomUis.keys())) this.closeCustomUi(id, undefined);
+    this.disposeAllWidgets();
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
     this.listeners = [];
@@ -821,6 +842,99 @@ export class AgentSessionWrapper {
 
   private getExtensionWidgets(): ExtensionWidgetItem[] {
     return Array.from(this.extensionWidgets.values());
+  }
+
+  private installWidgetFactory(
+    key: string,
+    factory: (tui: unknown, theme: unknown) => unknown,
+    options?: { placement?: "aboveEditor" | "belowEditor" },
+  ): void {
+    this.disposeWidget(key);
+    const placement = options?.placement ?? "aboveEditor";
+    const width = this.getWidgetRenderWidth();
+    const tui = {
+      requestRender: () => {
+        const widget = this.activeWidgets.get(key);
+        if (!widget) return;
+        try {
+          const lines = widget.render(widget.width);
+          this.extensionWidgets.set(key, { key, lines, placement });
+          this.emitWidgetLines(key, lines, placement);
+        } catch (error) {
+          this.emitWidgetError(key, error);
+        }
+      },
+    };
+    let component: { render?: (renderWidth: number) => string[]; dispose?: () => void } | undefined;
+    try {
+      const result = factory(tui, MINIMAL_WIDGET_THEME);
+      if (result && typeof (result as { render?: unknown }).render === "function") {
+        component = result as { render?: (renderWidth: number) => string[]; dispose?: () => void };
+      }
+    } catch (error) {
+      this.emitWidgetError(key, error);
+      return;
+    }
+    if (!component?.render) return;
+    let lines: string[];
+    try {
+      lines = component.render(width);
+    } catch (error) {
+      this.emitWidgetError(key, error);
+      return;
+    }
+    this.activeWidgets.set(key, { render: component.render, dispose: component.dispose, width });
+    this.extensionWidgets.set(key, { key, lines, placement });
+    this.emitWidgetLines(key, lines, placement);
+  }
+
+  private disposeWidget(key: string): void {
+    const widget = this.activeWidgets.get(key);
+    if (!widget) return;
+    this.activeWidgets.delete(key);
+    try {
+      widget.dispose?.();
+    } catch {
+      // Ignore widget disposal errors.
+    }
+  }
+
+  private disposeAllWidgets(): void {
+    for (const widget of this.activeWidgets.values()) {
+      try {
+        widget.dispose?.();
+      } catch {
+        // Ignore widget disposal errors during teardown.
+      }
+    }
+    this.activeWidgets.clear();
+    this.extensionWidgets.clear();
+  }
+
+  private emitWidgetLines(key: string, lines: string[], placement: "aboveEditor" | "belowEditor"): void {
+    this.emit({
+      type: "extension_ui_request",
+      id: randomUUID(),
+      method: "setWidget",
+      widgetKey: key,
+      widgetLines: lines,
+      widgetPlacement: placement,
+    } as ExtensionUiRequest as AgentEvent);
+  }
+
+  private emitWidgetError(key: string, error: unknown): void {
+    this.emit({
+      type: "extension_error",
+      extensionPath: `widget:${key}`,
+      event: "widget_render",
+      error: error instanceof Error ? error.message : String(error),
+    } as AgentEvent);
+  }
+
+  private getWidgetRenderWidth(): number {
+    // Desktop panel width - wider than a terminal's default so long widget
+    // lines are truncated less aggressively by extension widgets.
+    return 120;
   }
 
   private getCustomUiWidth(options: unknown): number {
@@ -1074,6 +1188,17 @@ export class AgentSessionWrapper {
         this.setExtensionStatus("hidden-thinking-label", label);
       },
       setWidget: (key, content, options) => {
+        // Widgets can be registered as a component factory (the form rpiv-todo
+        // and other TUI-aware extensions use). Execute the factory here and
+        // forward the rendered text lines to the desktop UI, mirroring how
+        // custom() runs TUI components in this process.
+        if (typeof content === "function") {
+          this.installWidgetFactory(key, content as (tui: unknown, theme: unknown) => unknown, options);
+          return;
+        }
+        // Replacing a factory-backed widget with a plain line array (or
+        // clearing it) must dispose the running factory component first.
+        this.disposeWidget(key);
         if (content !== undefined && !Array.isArray(content)) return;
         if (content === undefined) {
           this.extensionWidgets.delete(key);
@@ -1164,7 +1289,7 @@ export class AgentSessionWrapper {
       },
       reload: async () => {
         this.extensionStatuses.clear();
-        this.extensionWidgets.clear();
+        this.disposeAllWidgets();
         await this.inner.reload({
           beforeSessionStart: () => {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
