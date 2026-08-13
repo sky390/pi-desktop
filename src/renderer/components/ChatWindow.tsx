@@ -1126,7 +1126,9 @@ function NoticeShelf({
                 borderRadius: "50%",
                 background: color,
                 flexShrink: 0,
-                marginTop: 7,
+                // Align the dot with the center of the first text line
+                // (9px padding-top + 13px * 1.5 / 2 - 3.5px dot radius).
+                marginTop: 15,
               }}
             />
             <span
