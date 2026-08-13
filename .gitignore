@@ -17,3 +17,6 @@ build/toolchains/core/
 
 # Local AI session handoff file (never commit)
 CONTEXT.md
+
+# Local agent instruction file (never commit)
+AGENTS.md
