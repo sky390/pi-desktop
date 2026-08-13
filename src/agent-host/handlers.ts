@@ -56,7 +56,13 @@ import {
 } from "../contract/types";
 import type { SessionTreeNode } from "../shared/types";
 import { allowFileRoot, getAllowedFileRoots, invalidateAllowedRootsCache, isFilePathAllowed } from "./file-access";
-import { getRpcSession, getRunningRpcSessionIds, startRpcSession, subscribeRunningSessions } from "./rpc-manager";
+import {
+  activateSession,
+  getRpcSession,
+  getRunningRpcSessionIds,
+  startRpcSession,
+  subscribeRunningSessions,
+} from "./rpc-manager";
 import {
   buildSessionContext,
   buildSessionInfoFromManager,
@@ -1404,7 +1410,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       }
 
       const tempKey = `__new__${Date.now()}`;
-      const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, toolNames);
+      const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, toolNames, { activate: true });
       allowFileRoot(cwd);
 
       // ISSUE-003: single event-binding entry only (ensureSessionEvents)
@@ -1436,12 +1442,17 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       if (existing?.isAlive()) {
         // Ensure event subscription
         ensureSessionEvents(server, existing, sessionId);
+        // On a session switch, release the previous session's extension
+        // foreground and re-bind this one so extensions (e.g. rpiv-todo) attach
+        // to the currently shown session. No-op for repeated use of the same
+        // session.
+        await activateSession(sessionId);
         return existing.send(command);
       }
       const filePath = await resolveSessionPath(sessionId);
       if (!filePath) throw new RpcError({ code: "NOT_FOUND", message: "Session not found" });
       const cwd = SessionManager.open(filePath).getHeader()?.cwd ?? process.cwd();
-      const { session } = await startRpcSession(sessionId, filePath, cwd);
+      const { session } = await startRpcSession(sessionId, filePath, cwd, undefined, { activate: true });
       ensureSessionEvents(server, session, sessionId);
       return session.send(command);
     },

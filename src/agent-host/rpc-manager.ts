@@ -279,6 +279,46 @@ export class AgentSessionWrapper {
     });
   }
 
+  /**
+   * Dispatch session_shutdown to this session's bound extensions. Extension
+   * lifecycle state (e.g. rpiv-todo's activeRenderSession) is process-global,
+   * so a session that is never shut down keeps its pointer forever and the next
+   * session's session_start cannot claim the foreground. This restores the SDK
+   * semantics the CLI gets from AgentSessionRuntime.teardownCurrent.
+   */
+  async shutdownExtensions(reason = "new"): Promise<void> {
+    if (!this._alive) return;
+    const runner = this.inner.extensionRunner;
+    if (typeof runner.emit !== "function") return;
+    if (typeof runner.hasHandlers === "function" && !runner.hasHandlers("session_shutdown")) return;
+    try {
+      await runner.emit({
+        type: "session_shutdown",
+        reason,
+        targetSessionFile: this.sessionFile || undefined,
+      });
+    } catch (error) {
+      console.warn(
+        `[pi-desktop] session_shutdown dispatch failed for session ${this.sessionId}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /**
+   * Re-bind extensions so session_start is dispatched again for this session.
+   * Used when a previously-opened session is activated again (switch back),
+   * mirroring the CLI's rebind-after-shutdown flow so extensions re-claim this
+   * session as the foreground.
+   */
+  async rebindExtensions(): Promise<void> {
+    if (!this._alive) return;
+    this.extensionsBound = false;
+    this.extensionBindingPromise = null;
+    this.extensionBindingError = null;
+    await this.ensureExtensionsBound();
+  }
+
   private ensureExtensionsBound(options: ExtensionBindingOptions = {}): Promise<void> {
     if (options.forceEmptySystemPrompt) this.forceEmptySystemPrompt = true;
     if (this.extensionsBound) {
@@ -1322,6 +1362,11 @@ const startLocks = new Map<string, Promise<{ session: AgentSessionWrapper; realS
 const runningListeners = new Set<(ids: string[]) => void>();
 let registryCleanupInstalled = false;
 
+// The session currently shown in the UI. Used to detect session switches so
+// extension lifecycle events are only re-dispatched when the foreground
+// actually changes, not on every command sent to the same session.
+let activeSessionPointer: string | null = null;
+
 function getRegistry(): Map<string, AgentSessionWrapper> {
   if (!registryCleanupInstalled) {
     registryCleanupInstalled = true;
@@ -1339,6 +1384,47 @@ function getLocks(): Map<string, Promise<{ session: AgentSessionWrapper; realSes
 
 export function getRpcSession(sessionId: string): AgentSessionWrapper | undefined {
   return getRegistry().get(sessionId);
+}
+
+/**
+ * Tell every other open session's extensions to release the foreground
+ * (emit session_shutdown). Extension modules are process-global singletons
+ * (jiti-cached), so a stale session pointer blocks later session_start handlers
+ * from claiming the UI. Only the session that actually owns the foreground
+ * clears the shared pointer; the rest just evict their own task slot.
+ */
+async function shutdownOtherSessions(exceptSessionId: string): Promise<void> {
+  const jobs: Promise<void>[] = [];
+  for (const [sessionId, wrapper] of getRegistry()) {
+    if (sessionId === exceptSessionId || !wrapper.isAlive()) continue;
+    jobs.push(wrapper.shutdownExtensions("new"));
+  }
+  await Promise.allSettled(jobs);
+}
+
+/**
+ * Activate a session as the foreground: when the target differs from the
+ * previously activated one, shut down the other sessions' extensions and
+ * re-bind the target's extensions so session_start is dispatched again. This
+ * mirrors the SDK's switch→shutdown→rebind→session_start flow that the CLI
+ * gets from AgentSessionRuntime, which Pi Desktop otherwise skips entirely.
+ */
+export async function activateSession(sessionId: string): Promise<void> {
+  if (activeSessionPointer === sessionId) return;
+  await shutdownOtherSessions(sessionId);
+  const target = getRegistry().get(sessionId);
+  if (target?.isAlive()) {
+    // A re-bind failure must not block session activation: the session still
+    // works, extensions are best-effort here (their session_start re-dispatch
+    // can be retried by the next switch / Reload session).
+    await target.rebindExtensions().catch((error) => {
+      console.warn(
+        `[pi-desktop] extension re-bind failed for session ${sessionId}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+  }
+  activeSessionPointer = sessionId;
 }
 
 export function syncBrowserToolsForAllSessions(): void {
@@ -1404,18 +1490,36 @@ export async function startRpcSession(
   sessionFile: string,
   cwd: string,
   toolNames?: string[],
+  options: { activate?: boolean } = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
+  const { activate = false } = options;
   const registry = getRegistry();
   const locks = getLocks();
 
   const existing = registry.get(sessionId);
-  if (existing?.isAlive()) return { session: existing, realSessionId: sessionId };
+  if (existing?.isAlive()) {
+    if (activate) {
+      // Session switch semantics: extensions must release the old foreground
+      // and re-bind this session so its session_start can claim it (otherwise
+      // process-global extension state like rpiv-todo's activeRenderSession
+      // stays pinned to an earlier session and the widget never renders here).
+      await activateSession(sessionId);
+    }
+    return { session: existing, realSessionId: sessionId };
+  }
 
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
 
   const starting = (async () => {
     const agentDir = getAgentDir();
+
+    if (activate) {
+      // This is a brand-new foreground session: let any previously opened
+      // session's extensions release the foreground before this session's
+      // session_start fires (see activateSession above).
+      await shutdownOtherSessions(sessionId);
+    }
 
     const sessionManager = sessionFile
       ? SessionManager.open(sessionFile, undefined)
@@ -1484,9 +1588,13 @@ export async function startRpcSession(
     const realSessionFile = inner.sessionFile as string | undefined;
     if (realSessionFile) cacheSessionPath(realSessionId, realSessionFile);
 
-    wrapper.onDestroy(() => registry.delete(realSessionId));
+    wrapper.onDestroy(() => {
+      registry.delete(realSessionId);
+      if (activeSessionPointer === realSessionId) activeSessionPointer = null;
+    });
     registry.set(realSessionId, wrapper);
     wrapper.beginExtensionBinding({ forceEmptySystemPrompt: toolNames?.length === 0 });
+    if (activate) activeSessionPointer = realSessionId;
 
     return { session: wrapper, realSessionId };
   })().finally(() => locks.delete(sessionId));

@@ -64,13 +64,16 @@ interface ResourceLoaderLike {
   getSkills(): { skills: SkillLike[] };
 }
 
-interface ExtensionRunnerLike {
+export interface ExtensionRunnerLike {
   getRegisteredCommands(): Array<{
     invocationName: string;
     description?: string;
     sourceInfo: SlashCommandInfo["sourceInfo"];
   }>;
   setUIContext?(uiContext?: unknown, mode?: "tui" | "rpc" | "json" | "print"): void;
+  /** Dispatch a lifecycle event to all bound extensions. */
+  emit?(event: unknown): Promise<unknown>;
+  hasHandlers?(eventType: string): boolean;
 }
 
 type DialogOptionsLike = {
