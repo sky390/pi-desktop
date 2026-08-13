@@ -1091,13 +1091,11 @@ function NoticeShelf({
             className="notice-shelf-item"
             style={{
               display: "flex",
-              alignItems: "center",
+              alignItems: "flex-start",
               gap: 10,
-              minHeight: 60,
-              height: 60,
-              maxHeight: 60,
+              minHeight: 40,
               marginBottom: index === notices.length - 1 ? 0 : 6,
-              overflow: "hidden",
+              overflowY: "auto",
               borderRadius: 14,
               border: "1px solid color-mix(in srgb, var(--border) 70%, transparent)",
               background: "var(--bg)",
@@ -1107,8 +1105,9 @@ function NoticeShelf({
               boxShadow: floating
                 ? "0 1px 2px rgba(15,23,42,0.05), 0 10px 28px -14px rgba(15,23,42,0.24)"
                 : "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
-              fontSize: 18,
-              lineHeight: 1.45,
+              fontSize: 13,
+              lineHeight: 1.5,
+              maxHeight: 320,
               transformOrigin: "top center",
               animation: notice.exiting
                 ? "notice-shelf-out 0.18s ease-in forwards"
@@ -1123,16 +1122,18 @@ function NoticeShelf({
                 borderRadius: "50%",
                 background: color,
                 flexShrink: 0,
+                marginTop: 7,
               }}
             />
             <span
               style={{
-                padding: "14px 0",
+                padding: "9px 0",
                 minWidth: 0,
                 maxWidth: "100%",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
               }}
             >
               {notice.message}
