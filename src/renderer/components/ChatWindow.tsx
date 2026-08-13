@@ -1070,6 +1070,13 @@ function NoticeShelf({
   onDismiss?: (id: string) => void;
 }) {
   if (notices.length === 0) return null;
+  // Map rpiv-todo's status glyphs (○/◐/✓) to emoji, mirroring the widget
+  // theme mapping in rpc-manager.ts so /todos output matches the panel.
+  const mapStatusIcons = (text: string) =>
+    text
+      .replaceAll("○", "⏳") // pending
+      .replaceAll("◐", "🧠") // in_progress
+      .replaceAll("✓", "✨"); // completed
   return (
     <div
       style={{
@@ -1142,7 +1149,7 @@ function NoticeShelf({
                 wordBreak: "break-word",
               }}
             >
-              {notice.message}
+              {mapStatusIcons(notice.message)}
             </span>
             {onDismiss && (
               <button
