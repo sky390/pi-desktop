@@ -58,6 +58,7 @@ import type { SessionTreeNode } from "../shared/types";
 import { allowFileRoot, getAllowedFileRoots, invalidateAllowedRootsCache, isFilePathAllowed } from "./file-access";
 import {
   activateSession,
+  forceRunningChange,
   getRpcSession,
   getRunningRpcSessionIds,
   startRpcSession,
@@ -67,10 +68,15 @@ import {
   buildSessionContext,
   buildSessionInfoFromManager,
   getSessionIndexMetrics,
+  invalidateAllSessionPathCache,
   invalidateSessionPathCache,
   listAllSessions,
   resolveSessionPath,
 } from "./session-reader";
+import { restartSessionWatcher } from "./session-watcher";
+// Re-exported so the esbuild-bundled test module can stop the watcher that a
+// host.refresh restarts (the watcher keeps the process alive if left open).
+export { stopSessionWatcher } from "./session-watcher";
 import { isFilePathReferencedBySession } from "./session-file-references";
 import {
   addWorktree,
@@ -1049,6 +1055,72 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
 
   server.handle({
     "host.ping": () => ({ ok: true as const, ts: Date.now() }),
+
+    "host.refresh": async () => {
+      // Full soft-reset, mirroring what a restart of the app rebuilds:
+      // 1. Re-scan the session index from disk (fingerprint-reused so this is
+      //    cheap when nothing changed) and drop stale path-cache entries.
+      const sessions = await listAllSessions();
+      const indexMetrics = getSessionIndexMetrics();
+      invalidateAllSessionPathCache();
+
+      // 2. Reload the shared model runtime's local config/cache. Best-effort:
+      //    a failure must not abort the refresh — the next network refresh
+      //    (models.refresh) can still rebuild it. getSharedModelRuntime() is
+      //    called first so a freshly added model is picked up even when the
+      //    runtime was never initialized yet (otherwise reloadSharedModelRuntimeConfig
+      //    would be a silent no-op until the next app restart).
+      let modelRuntimeReloaded = false;
+      try {
+        await getSharedModelRuntime();
+        await reloadSharedModelRuntimeConfig();
+        modelRuntimeReloaded = true;
+      } catch (error) {
+        console.warn(
+          `[agent-host] host.refresh: model runtime reload failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      // 3. Re-run startup migrations so self-healing (legacy enabledModels,
+      //    sidecar renames, mirror repair) applies to external edits made since
+      //    launch — same as a restart would do.
+      let migrations = false;
+      try {
+        await runStartupMigrations();
+        migrations = true;
+      } catch (error) {
+        console.warn(
+          `[agent-host] host.refresh: startup migrations failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      // 4. Re-apply persisted proxy settings in case settings.json changed.
+      applySavedProxySettings();
+
+      // 5. Tear down and rebuild the session watcher (a wedged fs.watch is the
+      //    most common reason a manual refresh appears to do nothing).
+      const watcherRestarted = restartSessionWatcher(server) !== null;
+
+      // 6. Force-broadcast the current running set so the sidebar re-syncs
+      //    even when no running state changed.
+      forceRunningChange();
+
+      return {
+        sessions: {
+          count: sessions.length,
+          indexMs: indexMetrics.totalMs,
+          filesDiscovered: indexMetrics.filesDiscovered,
+          filesParsed: indexMetrics.filesParsed,
+          filesReused: indexMetrics.filesReused,
+          invalidFiles: indexMetrics.invalidFiles,
+        },
+        modelRuntimeReloaded,
+        migrations,
+        proxyRestored: true,
+        watcherRestarted,
+        runningSessionIds: getRunningRpcSessionIds(),
+      };
+    },
 
     "host.toolchain": async (params) => {
       const { cwd } = params as { cwd: string };

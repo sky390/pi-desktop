@@ -222,6 +222,10 @@ export async function listModels(cwd?: string) {
   return call("models.list", cwd ? { cwd } : undefined);
 }
 
+export async function refreshHost() {
+  return call("host.refresh");
+}
+
 export async function refreshModels(cwd: string | undefined, requestId: string) {
   return call("models.refresh", { ...(cwd ? { cwd } : {}), requestId });
 }

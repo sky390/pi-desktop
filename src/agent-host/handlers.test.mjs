@@ -67,10 +67,11 @@ async function captureHandlers() {
 
 test("registerHandlers exposes every contract method exactly once", async () => {
   const { handlers } = await captureHandlers();
-  assert.equal(Object.keys(handlers).length, 76);
+  assert.equal(Object.keys(handlers).length, 77);
   for (const method of [
     "host.ping",
     "host.toolchain",
+    "host.refresh",
     "sessions.list",
     "sessions.contextPage",
     "sessions.entryContent",
@@ -99,6 +100,46 @@ test("registerHandlers exposes every contract method exactly once", async () => 
   ]) {
     assert.equal(typeof handlers[method], "function", `${method} must be registered`);
   }
+});
+
+test("host.refresh performs a full soft reset and re-broadcasts running state", async () => {
+  const { handlers, events } = await captureHandlers();
+
+  const before = await handlers["sessions.list"]();
+  let result;
+  let again;
+  try {
+    result = await handlers["host.refresh"]();
+    // Idempotent: a second refresh reports the same session count.
+    again = await handlers["host.refresh"]();
+  } finally {
+    // host.refresh rebuilds the session watcher (a real fs.watch); stop it so
+    // the test process can exit instead of waiting on the open watcher. On
+    // Windows the fs.watch handle is released asynchronously after close(), so
+    // wait briefly for the handle to drain before the runner checks for
+    // lingering resources.
+    const { stopSessionWatcher } = await loadHandlersModule();
+    stopSessionWatcher();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  assert.equal(typeof result.sessions.count, "number");
+  assert.equal(typeof result.sessions.indexMs, "number");
+  assert.equal(typeof result.sessions.filesDiscovered, "number");
+  assert.equal(typeof result.modelRuntimeReloaded, "boolean");
+  assert.equal(typeof result.migrations, "boolean");
+  assert.equal(result.proxyRestored, true);
+  assert.equal(typeof result.watcherRestarted, "boolean");
+  assert.ok(Array.isArray(result.runningSessionIds));
+  assert.deepEqual(result.runningSessionIds, before.runningSessionIds);
+
+  // The refresh must force-broadcast the running set (agent.running) even when
+  // nothing changed, so a manual refresh re-syncs the sidebar like a restart.
+  const runningEvents = events.filter((e) => e.topic === "agent.running");
+  assert.ok(runningEvents.length > 0, "host.refresh must emit an agent.running snapshot");
+
+  // Idempotent: a second refresh reports the same session count.
+  assert.equal(again.sessions.count, result.sessions.count);
 });
 
 test("credential mutation failures distinguish committed state from an unverified mutation", async () => {

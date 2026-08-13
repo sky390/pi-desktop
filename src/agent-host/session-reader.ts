@@ -88,6 +88,10 @@ export function invalidateSessionPathCache(sessionId: string): void {
   getPathCache().delete(sessionId);
 }
 
+export function invalidateAllSessionPathCache(): void {
+  getPathCache().clear();
+}
+
 function findCachedSessionId(filePath: string): string | undefined {
   for (const [id, cachedPath] of getPathCache()) {
     if (cachedPath === filePath) return id;

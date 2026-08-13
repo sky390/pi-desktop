@@ -94,11 +94,46 @@ export function startSessionWatcher(server: RpcServer): () => void {
     console.error("[agent-host] session watcher failed:", err);
   }
 
-  return () => {
+  const stop = () => {
     if (timer) clearTimeout(timer);
     watcher?.close();
     setAllowedRootsWatcherHealthy(false);
   };
+  trackSessionWatcher(stop);
+  return stop;
+}
+
+// Module-level active watcher so a soft refresh (host.refresh) can tear down a
+// possibly wedged fs.watch and rebuild it — the same effect as a full restart.
+let activeStopWatcher: (() => void) | null = null;
+
+/** Track the currently running watcher; called by startSessionWatcher. */
+export function trackSessionWatcher(stop: () => void): void {
+  activeStopWatcher = stop;
+}
+
+/** Stop and restart the session watcher (used by host.refresh). Returns the
+ * new stop function, or null when the watcher could not be (re)started. */
+export function restartSessionWatcher(server: RpcServer): (() => void) | null {
+  stopSessionWatcher();
+  try {
+    const stop = startSessionWatcher(server);
+    activeStopWatcher = stop;
+    return stop;
+  } catch (error) {
+    console.error("[agent-host] failed to restart session watcher:", error);
+    return null;
+  }
+}
+
+/** Stop the currently active session watcher, if any. */
+export function stopSessionWatcher(): void {
+  try {
+    activeStopWatcher?.();
+  } catch (error) {
+    console.error("[agent-host] failed to stop session watcher:", error);
+  }
+  activeStopWatcher = null;
 }
 
 export function agentSessionsPath(): string {

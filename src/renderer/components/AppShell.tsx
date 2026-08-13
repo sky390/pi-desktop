@@ -117,6 +117,10 @@ export function AppShell() {
   const [channelSnapshot, setChannelSnapshot] = useState<ChannelsSnapshot>(EMPTY_CHANNELS);
   const [modelsRefreshKey, setModelsRefreshKey] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [refreshToast, setRefreshToast] = useState<{ id: number; message: string; type: "success" | "error" } | null>(
+    null,
+  );
+  const refreshToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [mobileSidebarReady, setMobileSidebarReady] = useState(false);
 
   // On mobile the sidebar is an overlay drawer; hide it by default so the chat
@@ -485,6 +489,23 @@ export function AppShell() {
     [router, selectedSession],
   );
 
+  // After a full refresh (sidebar refresh button), re-scan the file explorer
+  // (the same re-scan AppShell performs on a fresh app launch) and surface the
+  // result as a full-width toast. Update checks are intentionally NOT triggered.
+  const handleFullRefresh = useCallback(
+    (result?: { summary: string; type: "success" | "error" }) => {
+      if (activeFileTabId === EXPLORER_TAB_ID) {
+        setExplorerRefreshKey((key) => key + 1);
+      }
+      if (result) {
+        setRefreshToast({ id: Date.now(), message: result.summary, type: result.type });
+        if (refreshToastTimerRef.current) clearTimeout(refreshToastTimerRef.current);
+        refreshToastTimerRef.current = setTimeout(() => setRefreshToast(null), 6000);
+      }
+    },
+    [activeFileTabId],
+  );
+
   const handleSelectSession = useCallback(
     (session: SessionInfo, isRestore = false) => {
       beginSessionLoadTrace(session.id, isRestore ? "restore" : "selection");
@@ -649,6 +670,7 @@ export function AppShell() {
         onSessionDeleted={handleSessionDeleted}
         selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
         onCwdChange={handleCwdChange}
+        onFullRefresh={handleFullRefresh}
       />
       <div style={{ padding: "8px", flexShrink: 0 }}>
         <button
@@ -1732,6 +1754,65 @@ export function AppShell() {
             setSettingsOpen(true);
           }}
         />
+      )}
+      {refreshToast && (
+        <div
+          role="status"
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 300,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 10,
+            maxWidth: "min(calc(100vw - 32px), 560px)",
+            borderRadius: 14,
+            border: `1px solid ${
+              refreshToast.type === "error"
+                ? "color-mix(in srgb, #ef4444 40%, transparent)"
+                : "color-mix(in srgb, #10b981 40%, transparent)"
+            }`,
+            background: "var(--bg)",
+            color: "var(--text)",
+            boxShadow: "0 1px 2px rgba(15,23,42,0.05), 0 10px 28px -14px rgba(15,23,42,0.24)",
+            fontSize: 13,
+            lineHeight: 1.5,
+            padding: "10px 12px",
+            animation: "notice-shelf-in 0.18s ease-out both",
+            pointerEvents: "auto",
+          }}
+        >
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              background: refreshToast.type === "error" ? "#ef4444" : "#10b981",
+              flexShrink: 0,
+              marginTop: 7,
+            }}
+          />
+          <span style={{ minWidth: 0, wordBreak: "break-word" }}>{refreshToast.message}</span>
+          <button
+            type="button"
+            onClick={() => setRefreshToast(null)}
+            aria-label={t("closeNotice", "Close")}
+            title={t("closeNotice", "Close")}
+            style={{
+              background: "none",
+              border: "none",
+              color: "var(--text-dim)",
+              cursor: "pointer",
+              fontSize: 15,
+              lineHeight: 1,
+              padding: "0 0 0 2px",
+              flexShrink: 0,
+            }}
+          >
+            ×
+          </button>
+        </div>
       )}
     </>
   );

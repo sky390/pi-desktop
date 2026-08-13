@@ -7,7 +7,7 @@ import { browserCapabilityRuntime } from "../agent-host/browser-capability-runti
 import { registerHandlers } from "../agent-host/handlers";
 import { installToolchainGitRunner } from "../agent-host/toolchain-git";
 import { getRpcSession, syncBrowserToolsForAllSessions } from "../agent-host/rpc-manager";
-import { startSessionWatcher } from "../agent-host/session-watcher";
+import { startSessionWatcher, stopSessionWatcher } from "../agent-host/session-watcher";
 import { toolchainRuntime } from "../agent-host/toolchain-runtime";
 import type { ToolchainSnapshot } from "../shared/toolchains/types";
 
@@ -28,7 +28,7 @@ type FauxCore = ReturnType<typeof createFauxCore>;
 const server = createRpcServer();
 const restoreGitRunner = installToolchainGitRunner();
 const stopHandlers = registerHandlers(server);
-const stopWatcher = startSessionWatcher(server);
+void startSessionWatcher(server);
 const fauxBySession = new Map<string, FauxCore>();
 
 function log(message: string): void {
@@ -267,7 +267,7 @@ parentPort.on("message", (event) => {
     return;
   }
   if (message.type === "shutdown") {
-    stopWatcher();
+    stopSessionWatcher();
     restoreGitRunner();
     void stopHandlers().finally(() => process.exit(0));
   }

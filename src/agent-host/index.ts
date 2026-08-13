@@ -4,7 +4,7 @@
  */
 import { createRpcServer } from "../contract/rpc";
 import { applySavedProxySettings, registerHandlers, runStartupMigrations } from "./handlers";
-import { startSessionWatcher } from "./session-watcher";
+import { startSessionWatcher, stopSessionWatcher } from "./session-watcher";
 import { toolchainRuntime } from "./toolchain-runtime";
 import type { ToolchainSnapshot } from "../shared/toolchains/types";
 import { installToolchainGitRunner } from "./toolchain-git";
@@ -29,7 +29,9 @@ applySavedProxySettings();
 // self-heals a mirror polluted with patterns for unconfigured providers.
 void runStartupMigrations();
 const stopHandlers = registerHandlers(server);
-const stopWatcher = startSessionWatcher(server);
+// startSessionWatcher also registers itself as the tracked active watcher, so
+// host.refresh (which restarts it) and shutdown both stop the *latest* one.
+void startSessionWatcher(server);
 
 function log(message: string): void {
   try {
@@ -86,7 +88,7 @@ if (parentPort) {
       return;
     }
     if (msg?.type === "shutdown") {
-      stopWatcher();
+      stopSessionWatcher();
       restoreGitRunner();
       void stopHandlers().finally(() => process.exit(0));
     }

@@ -55,6 +55,27 @@ export interface Api {
       capabilities: Partial<Record<ToolCapabilityId, { provider: ToolProvider; version: string }>>;
     };
   };
+  /** Full soft-reset of the agent host, equivalent to an app restart: rebuild the
+   * session index, clear path caches, reload model/proxy config, re-run startup
+   * migrations, restart the session watcher and re-broadcast running state. */
+  "host.refresh": {
+    params: void;
+    result: {
+      sessions: {
+        count: number;
+        indexMs: number;
+        filesDiscovered: number;
+        filesParsed: number;
+        filesReused: number;
+        invalidFiles: number;
+      };
+      modelRuntimeReloaded: boolean;
+      migrations: boolean;
+      proxyRestored: boolean;
+      watcherRestarted: boolean;
+      runningSessionIds: string[];
+    };
+  };
 
   // Sessions & projects
   "sessions.list": {

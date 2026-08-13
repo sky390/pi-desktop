@@ -1480,6 +1480,14 @@ export function notifyRunningChange(): void {
   }
 }
 
+/** Broadcast the current running-session-id set even if it did not change.
+ * Used by host.refresh so a manual refresh always re-syncs the sidebar with
+ * the live state, matching what a full app restart would show. */
+export function forceRunningChange(): void {
+  lastRunningSnapshot = "";
+  notifyRunningChange();
+}
+
 /**
  * Get or create an AgentSession for the given session.
  * For new sessions (sessionFile === ""), pi generates its own id.

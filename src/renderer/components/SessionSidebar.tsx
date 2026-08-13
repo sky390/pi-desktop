@@ -25,6 +25,9 @@ interface Props {
   onSessionDeleted?: (sessionId: string) => void;
   selectedCwd?: string | null;
   onCwdChange?: (cwd: string | null, projectRoot?: string | null) => void;
+  /** Called after a full refresh completes, so the shell can re-sync UI state
+   *  (file explorer) and surface the result as a full-width notification. */
+  onFullRefresh?: (result: { summary: string; type: "success" | "error" }) => void;
 }
 
 interface WorktreeEntry {
@@ -341,6 +344,7 @@ export function SessionSidebar({
   onSessionDeleted,
   selectedCwd: selectedCwdProp,
   onCwdChange,
+  onFullRefresh,
 }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
@@ -378,6 +382,7 @@ export function SessionSidebar({
   const wtDropdownRef = useRef<HTMLDivElement>(null);
   const wtNewInputRef = useRef<HTMLInputElement>(null);
   const [sessionRefreshDone, setSessionRefreshDone] = useState(false);
+  const [sessionRefreshing, setSessionRefreshing] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
@@ -385,8 +390,11 @@ export function SessionSidebar({
   // running state; late session responses must not overwrite it.
   const streamAuthoritativeRef = useRef(false);
   const sessionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumping this key tears down and rebuilds the running-state EventSource, so a
+  // manual refresh always re-syncs the stream with the host (restart equivalent).
+  const [runningStreamKey, setRunningStreamKey] = useState(0);
 
-  const loadSessions = useCallback(async (showLoading = false) => {
+  const loadSessions = useCallback(async (showLoading = false): Promise<SessionInfo[] | null> => {
     try {
       if (showLoading) setLoading(true);
       const res = await fetch("/api/sessions");
@@ -419,8 +427,10 @@ export function SessionSidebar({
         if (sessionRefreshTimerRef.current) clearTimeout(sessionRefreshTimerRef.current);
         sessionRefreshTimerRef.current = setTimeout(() => setSessionRefreshDone(false), 2000);
       }
+      return sessions;
     } catch (e) {
       setError(String(e));
+      return null;
     } finally {
       if (showLoading) setLoading(false);
     }
@@ -440,7 +450,8 @@ export function SessionSidebar({
   }, [unreadSessionIds]);
 
   useEffect(() => {
-    // Live running status via IPC stream (shimmed as EventSource).
+    // Live running status via IPC stream (shimmed as EventSource). Rebuilt on
+    // every runningStreamKey bump so a manual refresh reconnects the stream.
     const source = new EventSource("/api/agent/running/events");
 
     source.onmessage = (e) => {
@@ -460,7 +471,62 @@ export function SessionSidebar({
     };
 
     return () => source.close();
-  }, []);
+  }, [runningStreamKey]);
+
+  // Full soft-reset: ask the agent host to rebuild its state (session index,
+  // caches, model runtime, proxy, migrations, watcher) exactly like an app
+  // restart would, then re-fetch sessions and reconnect the running stream.
+  const handleFullRefresh = useCallback(async () => {
+    if (sessionRefreshing) return;
+    setSessionRefreshing(true);
+    const beforeIds = new Set(allSessions.map((s) => s.id));
+    const startedAt = Date.now();
+    // Keep the spinner visible long enough to be noticed even when the host
+    // responds in a few milliseconds.
+    const minimumVisible = (async () => {
+      const elapsed = Date.now() - startedAt;
+      const rest = 350 - elapsed;
+      if (rest > 0) await new Promise((resolve) => setTimeout(resolve, rest));
+    })();
+    try {
+      const { refreshHost } = await import("@/lib/api-client");
+      const result = await refreshHost();
+      await minimumVisible;
+      // Host already re-broadcast the running set; re-fetch the session list
+      // (loadSessions also applies running ids while the stream is cold) and
+      // reconnect the stream so the sidebar matches a fresh start.
+      const sessions = await loadSessions(false);
+      setRunningStreamKey((key) => key + 1);
+      const afterIds = new Set((sessions ?? []).map((s) => s.id));
+      const added = [...afterIds].filter((id) => !beforeIds.has(id)).length;
+      const removed = [...beforeIds].filter((id) => !afterIds.has(id)).length;
+      const parts: string[] = [
+        t("refreshSummarySessions", "会话 {count}").replace("{count}", String(sessions?.length ?? 0)),
+        // The disk-scan figures come straight from host.refresh and only exist
+        // when a full refresh actually re-scanned the sessions directory — they
+        // are the visible proof the refresh did real work even when nothing changed.
+        t("refreshSummaryScanned", "扫描 {count} 个文件").replace(
+          "{count}",
+          String(result.sessions?.filesDiscovered ?? 0),
+        ),
+        t("refreshSummaryMs", "{ms}ms").replace("{ms}", String(Math.round(result.sessions?.indexMs ?? 0))),
+      ];
+      if (added > 0) parts.push(t("refreshSummaryAdded", "新增 {count}").replace("{count}", String(added)));
+      if (removed > 0) parts.push(t("refreshSummaryRemoved", "移除 {count}").replace("{count}", String(removed)));
+      if (result.modelRuntimeReloaded) parts.push(t("refreshSummaryModels", "模型已重载"));
+      if (result.migrations) parts.push(t("refreshSummaryMigrations", "自愈已执行"));
+      if (result.watcherRestarted) parts.push(t("refreshSummaryWatcher", "监听已重建"));
+      onFullRefresh?.({ summary: parts.join(" · "), type: "success" });
+    } catch (e) {
+      setError(String(e));
+      onFullRefresh?.({
+        summary: `${t("refreshFailed", "刷新失败")}：${e instanceof Error ? e.message : String(e)}`,
+        type: "error",
+      });
+    } finally {
+      setSessionRefreshing(false);
+    }
+  }, [allSessions, loadSessions, onFullRefresh, sessionRefreshing, t]);
 
   // sessions.changed (CLI / disk watcher) → refresh sidebar without polling
   useEffect(() => {
@@ -866,10 +932,46 @@ export function SessionSidebar({
           gap: 10,
         }}
       >
+        {sessionRefreshing && (
+          <div
+            role="status"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "8px 10px",
+              background: "color-mix(in srgb, var(--accent) 12%, transparent)",
+              border: "1px solid var(--accent-soft-border)",
+              borderRadius: 8,
+              fontSize: 12,
+              color: "var(--text)",
+              lineHeight: 1.4,
+              flexShrink: 0,
+            }}
+          >
+            <svg
+              width="13"
+              height="13"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="var(--accent)"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              style={{ animation: "spin 0.9s linear infinite", flexShrink: 0 }}
+            >
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
+            <span>{t("refreshingAll", "正在全面刷新…")}</span>
+          </div>
+        )}
+
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <PiAgentTitle />
           <button
-            onClick={() => loadSessions(false)}
+            onClick={() => void handleFullRefresh()}
+            disabled={sessionRefreshing}
             style={{
               display: "flex",
               alignItems: "center",
@@ -879,29 +981,45 @@ export function SessionSidebar({
                 : "var(--bg-hover)",
               border: `1px solid ${sessionRefreshDone ? "color-mix(in srgb, var(--success) 40%, transparent)" : "var(--border)"}`,
               color: sessionRefreshDone ? "var(--success)" : "var(--text-muted)",
-              cursor: "pointer",
+              cursor: sessionRefreshing ? "wait" : "pointer",
               width: 32,
               height: 32,
               borderRadius: 7,
               padding: 0,
               flexShrink: 0,
+              opacity: sessionRefreshing ? 0.75 : 1,
               transition: "background 0.3s, color 0.3s, border-color 0.3s",
             }}
             onMouseEnter={(e) => {
-              if (sessionRefreshDone) return;
+              if (sessionRefreshDone || sessionRefreshing) return;
               e.currentTarget.style.background = "var(--bg-selected)";
               e.currentTarget.style.color = "var(--accent)";
               e.currentTarget.style.borderColor = "var(--accent-soft-border)";
             }}
             onMouseLeave={(e) => {
-              if (sessionRefreshDone) return;
+              if (sessionRefreshDone || sessionRefreshing) return;
               e.currentTarget.style.background = "var(--bg-hover)";
               e.currentTarget.style.color = "var(--text-muted)";
               e.currentTarget.style.borderColor = "var(--border)";
             }}
-            title={t("refresh", "Refresh")}
+            title={sessionRefreshing ? t("refreshing", "正在刷新…") : t("refreshFull", "全面刷新")}
           >
-            {sessionRefreshDone ? (
+            {sessionRefreshing ? (
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                style={{ animation: "spin 0.9s linear infinite" }}
+              >
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+            ) : sessionRefreshDone ? (
               <svg
                 width="15"
                 height="15"
