@@ -1195,6 +1195,10 @@ export class AgentSessionWrapper {
       setHiddenThinkingLabel: (label) => {
         this.setExtensionStatus("hidden-thinking-label", label);
       },
+      questionnaire: (params) =>
+        this.requestExtensionUi({ method: "questionnaire", questions: params.questions }, undefined, (response) =>
+          "answers" in response ? { answers: response.answers, cancelled: response.cancelled } : undefined,
+        ),
       setWidget: (key, content, options) => {
         // Widgets can be registered as a component factory (the form rpiv-todo
         // and other TUI-aware extensions use). Execute the factory here and

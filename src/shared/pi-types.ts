@@ -4,6 +4,7 @@ import type {
   SettingsManager,
   SlashCommandInfo,
 } from "@earendil-works/pi-coding-agent";
+import type { ExtensionQuestionnaireAnswer, ExtensionQuestionnaireQuestion } from "./types";
 
 export interface ContextUsage {
   percent: number | null;
@@ -98,6 +99,9 @@ export interface ExtensionUiContextLike {
     content: string[] | ((...args: never[]) => unknown) | undefined,
     options?: WidgetOptionsLike,
   ): void;
+  questionnaire(params: {
+    questions: ExtensionQuestionnaireQuestion[];
+  }): Promise<{ answers: ExtensionQuestionnaireAnswer[]; cancelled: boolean } | undefined>;
   setFooter(factory: unknown): void;
   setHeader(factory: unknown): void;
   setTitle(title: string): void;

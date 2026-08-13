@@ -112,6 +112,36 @@ export interface CustomMessage {
 
 export type AgentMessage = UserMessage | AssistantMessage | ToolResultMessage | CustomMessage;
 
+/**
+ * One questionnaire question as delivered by the extension to the desktop
+ * renderer (mirrors `QuestionData` in the extension's tool/types.ts).
+ */
+export interface ExtensionQuestionnaireQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: Array<{
+    label: string;
+    description: string;
+    preview?: string;
+  }>;
+}
+
+/**
+ * One answered question as produced by the desktop questionnaire dialog and
+ * returned to the extension (mirrors `QuestionAnswer` in the extension's
+ * tool/types.ts).
+ */
+export interface ExtensionQuestionnaireAnswer {
+  questionIndex: number;
+  question: string;
+  kind: "option" | "custom" | "multi";
+  answer: string | null;
+  selected?: string[];
+  notes?: string;
+  preview?: string;
+}
+
 export type ExtensionUiRequest =
   | {
       type: "extension_ui_request";
@@ -189,12 +219,26 @@ export type ExtensionUiRequest =
       method: "custom";
       lines: string[];
       closed?: boolean;
+    }
+  | {
+      type: "extension_ui_request";
+      id: string;
+      method: "questionnaire";
+      questions: ExtensionQuestionnaireQuestion[];
+      timeout?: number;
+      expiresAt?: number;
     };
 
 export type ExtensionUiResponse =
   | { type: "extension_ui_response"; id: string; value: string }
   | { type: "extension_ui_response"; id: string; confirmed: boolean }
-  | { type: "extension_ui_response"; id: string; cancelled: true };
+  | { type: "extension_ui_response"; id: string; cancelled: true }
+  | {
+      type: "extension_ui_response";
+      id: string;
+      answers: ExtensionQuestionnaireAnswer[];
+      cancelled: boolean;
+    };
 
 export interface ExtensionStatusItem {
   key: string;

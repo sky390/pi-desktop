@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect, useReducer } from "react";
 import type {
   AgentMessage,
   AssistantContentBlock,
+  ExtensionQuestionnaireAnswer,
   ExtensionStatusItem,
   ExtensionUiRequest,
   ExtensionWidgetItem,
@@ -90,6 +91,7 @@ function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] 
 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
+type ExtensionUiQuestionnaireRequest = Extract<ExtensionUiRequest, { method: "questionnaire" }>;
 export type NoticeType = "info" | "success" | "warning" | "error";
 
 export type NoticeItem = {
@@ -380,6 +382,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [sessionStatsOverride, setSessionStatsOverride] = useState<SessionStatsInfo | null>(null);
   const [extensionDialog, setExtensionDialog] = useState<ExtensionUiDialogRequest | null>(null);
   const [extensionCustomUi, setExtensionCustomUi] = useState<ExtensionUiCustomRequest | null>(null);
+  const [extensionQuestionnaire, setExtensionQuestionnaire] = useState<ExtensionUiQuestionnaireRequest | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
@@ -858,6 +861,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     [],
   );
 
+  const respondToExtensionQuestionnaire = useCallback(
+    async (
+      request: ExtensionUiQuestionnaireRequest,
+      response: { answers: ExtensionQuestionnaireAnswer[]; cancelled: boolean },
+    ) => {
+      const sid = sessionIdRef.current;
+      setExtensionQuestionnaire((current) => (current?.id === request.id ? null : current));
+      if (!sid) return;
+      try {
+        await sendAgentCommand(sid, {
+          type: "extension_ui_response",
+          id: request.id,
+          ...response,
+        });
+      } catch (e) {
+        console.error("Failed to send extension questionnaire response:", e);
+      }
+    },
+    [],
+  );
+
   const sendExtensionCustomInput = useCallback(async (request: ExtensionUiCustomRequest, data: string) => {
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -934,6 +958,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             if (request.closed) return current?.id === request.id ? null : current;
             return request;
           });
+          break;
+        case "questionnaire":
+          setExtensionQuestionnaire(request);
           break;
       }
     },
@@ -2010,9 +2037,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     dismissNotice: (id: string) => dispatchNotice({ type: "remove", id }),
     extensionDialog,
     extensionCustomUi,
+    extensionQuestionnaire,
     extensionStatuses,
     extensionWidgets,
     respondToExtensionUi,
+    respondToExtensionQuestionnaire,
     sendExtensionCustomInput,
     isAutoModelSelection: isNew && newSessionModel === null,
     agentPhase,

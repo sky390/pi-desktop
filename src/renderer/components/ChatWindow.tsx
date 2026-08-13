@@ -3,6 +3,8 @@ import type {
   AgentMessage,
   AssistantContentBlock,
   AssistantMessage,
+  ExtensionQuestionnaireAnswer,
+  ExtensionQuestionnaireQuestion,
   ExtensionUiRequest,
   SessionInfo,
   SessionTreeNode,
@@ -278,9 +280,11 @@ export function ChatWindow({
     dismissNotice,
     extensionDialog,
     extensionCustomUi,
+    extensionQuestionnaire,
     extensionStatuses,
     extensionWidgets,
     respondToExtensionUi,
+    respondToExtensionQuestionnaire,
     sendExtensionCustomInput,
     isAutoModelSelection,
     agentPhase,
@@ -561,6 +565,10 @@ export function ChatWindow({
       )}
 
       {extensionDialog && <ExtensionDialog request={extensionDialog} onRespond={respondToExtensionUi} />}
+
+      {extensionQuestionnaire && (
+        <QuestionnaireDialog request={extensionQuestionnaire} onRespond={respondToExtensionQuestionnaire} />
+      )}
 
       {extensionCustomUi && <ExtensionCustomPanel request={extensionCustomUi} onInput={sendExtensionCustomInput} />}
 
@@ -1369,6 +1377,653 @@ function ExtensionDialog({
               Submit
             </button>
           ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type QuestionnaireDialogRequest = Extract<ExtensionUiRequest, { method: "questionnaire" }>;
+
+type QuestionDraft = {
+  optionIndex: number | null;
+  checked: number[];
+  custom: string;
+  notes: string;
+};
+
+function answerSummary(q: ExtensionQuestionnaireQuestion, d: QuestionDraft): string {
+  if (d.custom.trim() !== "") return d.custom.trim();
+  if (q.multiSelect) return d.checked.map((idx) => q.options[idx].label).join(", ");
+  if (d.optionIndex !== null) return q.options[d.optionIndex].label;
+  return "";
+}
+
+function isQuestionAnswered(q: ExtensionQuestionnaireQuestion, d: QuestionDraft): boolean {
+  if (d.custom.trim() !== "") return true;
+  return q.multiSelect ? d.checked.length > 0 : d.optionIndex !== null;
+}
+
+/**
+ * Full-questionnaire dialog for `ask_user_question` in Pi Desktop.
+ *
+ * Replicates the rpiv-ask-user-question TUI semantics for desktop: per-question
+ * tabs plus a Submit review tab (multi-question runs), single/multi select,
+ * side-by-side previews, the "Type something." custom-answer escape, per-question
+ * notes, and Esc to abandon the whole questionnaire (cancelled). The produced
+ * `ExtensionQuestionnaireAnswer[]` mirrors `QuestionAnswer` in the extension.
+ */
+function QuestionnaireDialog({
+  request,
+  onRespond,
+}: {
+  request: QuestionnaireDialogRequest;
+  onRespond: (
+    request: QuestionnaireDialogRequest,
+    response: { answers: ExtensionQuestionnaireAnswer[]; cancelled: boolean },
+  ) => void;
+}) {
+  const { questions } = request;
+  const isMulti = questions.length > 1;
+  const [tab, setTab] = useState(0);
+  const [collapsed, setCollapsed] = useState(false);
+  const [drafts, setDrafts] = useState<QuestionDraft[]>(() =>
+    questions.map(() => ({ optionIndex: null, checked: [], custom: "", notes: "" })),
+  );
+  const [notesOpen, setNotesOpen] = useState<boolean[]>(() => questions.map(() => false));
+
+  useEffect(() => {
+    const onKeyDown = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (collapsed) {
+        // While minimized, Esc re-expands instead of abandoning the questionnaire.
+        e.preventDefault();
+        setCollapsed(false);
+        return;
+      }
+      onRespond(request, { answers: [], cancelled: true });
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [request, onRespond, collapsed]);
+
+  const updateDraft = (index: number, patch: Partial<QuestionDraft>) => {
+    setDrafts((prev) => prev.map((d, i) => (i === index ? { ...d, ...patch } : d)));
+  };
+
+  const buildAnswers = (): ExtensionQuestionnaireAnswer[] => {
+    const out: ExtensionQuestionnaireAnswer[] = [];
+    questions.forEach((q, i) => {
+      const d = drafts[i];
+      const notes = d.notes.trim() || undefined;
+      if (d.custom.trim() !== "") {
+        out.push({ questionIndex: i, question: q.question, kind: "custom", answer: d.custom.trim(), notes });
+      } else if (q.multiSelect) {
+        if (d.checked.length > 0) {
+          out.push({
+            questionIndex: i,
+            question: q.question,
+            kind: "multi",
+            answer: null,
+            selected: d.checked.map((idx) => q.options[idx].label),
+            notes,
+          });
+        }
+      } else if (d.optionIndex !== null) {
+        const o = q.options[d.optionIndex];
+        out.push({
+          questionIndex: i,
+          question: q.question,
+          kind: "option",
+          answer: o.label,
+          preview: o.preview && o.preview.length > 0 ? o.preview : undefined,
+          notes,
+        });
+      }
+    });
+    return out;
+  };
+
+  const submit = () => onRespond(request, { answers: buildAnswers(), cancelled: false });
+  const cancel = () => onRespond(request, { answers: [], cancelled: true });
+  const unansweredCount = questions.filter((_, i) => !isQuestionAnswered(questions[i], drafts[i])).length;
+
+  const q = tab < questions.length ? questions[tab] : null;
+  const d = q ? drafts[tab] : null;
+  const selectedOption = q && d && !q.multiSelect && d.optionIndex !== null ? q.options[d.optionIndex] : null;
+
+  if (collapsed) {
+    const answeredCount = questions.filter((_, i) => isQuestionAnswered(questions[i], drafts[i])).length;
+    return (
+      <button
+        onClick={() => setCollapsed(false)}
+        aria-label="Expand questionnaire"
+        title="Expand questionnaire"
+        style={{
+          position: "absolute",
+          zIndex: 90,
+          top: 12,
+          left: "50%",
+          transform: "translateX(-50%)",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
+          padding: "6px 12px",
+          border: "1px solid var(--border)",
+          borderRadius: 999,
+          background: "var(--bg)",
+          boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
+          color: "var(--text)",
+          fontSize: 12,
+          cursor: "pointer",
+        }}
+      >
+        <span style={{ fontSize: 13 }}>📋</span>
+        <span style={{ fontWeight: 650 }}>Questionnaire</span>
+        <span
+          style={{
+            color: answeredCount > 0 ? "var(--accent)" : "var(--text-muted)",
+            fontFamily: "var(--font-mono)",
+            fontSize: 11,
+          }}
+        >
+          {answeredCount}/{questions.length} answered
+        </span>
+        <span style={{ color: "var(--text-muted)", fontSize: 11 }}>▾</span>
+      </button>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        position: "absolute",
+        inset: 0,
+        zIndex: 90,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 20,
+        background: "rgba(0,0,0,0.18)",
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        style={{
+          width: "min(780px, 100%)",
+          maxHeight: "min(80vh, 640px)",
+          display: "flex",
+          flexDirection: "column",
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          background: "var(--bg)",
+          boxShadow: "0 20px 60px rgba(0,0,0,0.28)",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            padding: "12px 14px",
+            borderBottom: "1px solid var(--border)",
+          }}
+        >
+          <div>
+            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650 }}>Questionnaire</div>
+            <div style={{ marginTop: 3, color: "var(--text-dim)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
+              ask_user_question · {questions.length} question{questions.length > 1 ? "s" : ""}
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <button
+              onClick={() => setCollapsed(true)}
+              aria-label="Minimize questionnaire"
+              title="Minimize questionnaire (answers are kept)"
+              style={{
+                border: "none",
+                background: "none",
+                color: "var(--text-muted)",
+                fontSize: 18,
+                cursor: "pointer",
+                padding: "2px 8px",
+                borderRadius: 6,
+              }}
+            >
+              −
+            </button>
+            <button
+              onClick={cancel}
+              aria-label="Close questionnaire"
+              style={{
+                border: "none",
+                background: "none",
+                color: "var(--text-muted)",
+                fontSize: 18,
+                cursor: "pointer",
+                padding: "2px 8px",
+                borderRadius: 6,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        </div>
+
+        {isMulti && (
+          <div
+            style={{
+              display: "flex",
+              gap: 4,
+              padding: "8px 14px 0",
+              borderBottom: "1px solid var(--border)",
+              overflowX: "auto",
+            }}
+          >
+            {questions.map((question, i) => {
+              const answered = isQuestionAnswered(question, drafts[i]);
+              const active = tab === i;
+              return (
+                <button
+                  key={i}
+                  onClick={() => setTab(i)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: "6px 6px 0 0",
+                    border: "1px solid transparent",
+                    borderBottom: active ? "2px solid var(--accent)" : "2px solid transparent",
+                    background: active ? "var(--bg-panel)" : "transparent",
+                    color: active ? "var(--text)" : "var(--text-muted)",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {answered ? "✓ " : ""}
+                  {question.header || `Q${i + 1}`}
+                </button>
+              );
+            })}
+            <button
+              onClick={() => setTab(questions.length)}
+              style={{
+                padding: "6px 10px",
+                borderRadius: "6px 6px 0 0",
+                border: "1px solid transparent",
+                borderBottom: tab === questions.length ? "2px solid var(--accent)" : "2px solid transparent",
+                background: tab === questions.length ? "var(--bg-panel)" : "transparent",
+                color: tab === questions.length ? "var(--text)" : "var(--text-muted)",
+                fontSize: 12,
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Submit{unansweredCount > 0 ? ` (${unansweredCount} unanswered)` : ""}
+            </button>
+          </div>
+        )}
+
+        <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
+          {q && d ? (
+            <div style={{ display: "grid", gap: 12 }}>
+              <div>
+                <div style={{ color: "var(--text)", fontSize: 15, fontWeight: 600, lineHeight: 1.45 }}>
+                  {q.header ? (
+                    <span
+                      style={{
+                        display: "inline-block",
+                        marginRight: 8,
+                        padding: "2px 7px",
+                        borderRadius: 5,
+                        border: "1px solid var(--border)",
+                        color: "var(--text-muted)",
+                        fontSize: 11,
+                        verticalAlign: "middle",
+                      }}
+                    >
+                      {q.header}
+                    </span>
+                  ) : null}
+                  {q.question}
+                </div>
+                <div style={{ marginTop: 4, color: "var(--text-muted)", fontSize: 12 }}>
+                  {q.multiSelect ? "Select all that apply." : "Choose one."}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: selectedOption?.preview ? "1fr 260px" : "1fr",
+                  gap: 12,
+                  alignItems: "start",
+                }}
+              >
+                <div style={{ display: "grid", gap: 8 }}>
+                  {q.options.map((o, oi) => {
+                    const isSel = q.multiSelect ? d.checked.includes(oi) : d.optionIndex === oi;
+                    return (
+                      <button
+                        key={oi}
+                        onClick={() => {
+                          if (q.multiSelect) {
+                            updateDraft(tab, {
+                              checked: d.checked.includes(oi) ? d.checked.filter((x) => x !== oi) : [...d.checked, oi],
+                            });
+                          } else {
+                            updateDraft(tab, { optionIndex: d.optionIndex === oi ? null : oi });
+                          }
+                        }}
+                        style={{
+                          width: "100%",
+                          padding: "9px 10px",
+                          borderRadius: 7,
+                          border: isSel ? "1px solid var(--accent)" : "1px solid var(--border)",
+                          background: isSel ? "var(--bg-panel)" : "var(--bg-panel)",
+                          color: "var(--text)",
+                          cursor: "pointer",
+                          textAlign: "left",
+                          fontSize: 13,
+                        }}
+                      >
+                        <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                          <span style={{ color: isSel ? "var(--accent)" : "var(--text-muted)", fontSize: 13 }}>
+                            {q.multiSelect ? (isSel ? "☑" : "☐") : isSel ? "●" : "○"}
+                          </span>
+                          <span>
+                            <span style={{ fontWeight: 600 }}>{o.label}</span>
+                            <span style={{ color: "var(--text-muted)" }}> — {o.description}</span>
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+
+                  <div
+                    style={{
+                      padding: "9px 10px",
+                      borderRadius: 7,
+                      border: "1px dashed var(--border)",
+                      background: "var(--bg-panel)",
+                    }}
+                  >
+                    <textarea
+                      value={d.custom}
+                      placeholder="Type something."
+                      onChange={(e) => updateDraft(tab, { custom: e.target.value })}
+                      rows={Math.min(4, Math.max(2, d.custom.split("\n").length))}
+                      style={{
+                        width: "100%",
+                        border: "none",
+                        background: "transparent",
+                        color: "var(--text)",
+                        outline: "none",
+                        resize: "vertical",
+                        fontSize: 13,
+                        lineHeight: 1.5,
+                        fontFamily: "inherit",
+                      }}
+                    />
+                  </div>
+
+                  {notesOpen[tab] ? (
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <textarea
+                        autoFocus
+                        value={d.notes}
+                        placeholder="Note to attach to this answer…"
+                        onChange={(e) => updateDraft(tab, { notes: e.target.value })}
+                        rows={3}
+                        style={{
+                          width: "100%",
+                          padding: "8px 10px",
+                          borderRadius: 7,
+                          border: "1px solid var(--border)",
+                          background: "var(--bg)",
+                          color: "var(--text)",
+                          outline: "none",
+                          resize: "vertical",
+                          fontSize: 12,
+                          lineHeight: 1.5,
+                          fontFamily: "inherit",
+                        }}
+                      />
+                      <button
+                        onClick={() => setNotesOpen((prev) => prev.map((v, i) => (i === tab ? false : v)))}
+                        style={{
+                          justifySelf: "start",
+                          padding: "3px 8px",
+                          borderRadius: 5,
+                          border: "1px solid var(--border)",
+                          background: "var(--bg)",
+                          color: "var(--text-muted)",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Done
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => setNotesOpen((prev) => prev.map((v, i) => (i === tab ? true : v)))}
+                      style={{
+                        justifySelf: "start",
+                        padding: "3px 8px",
+                        borderRadius: 5,
+                        border: "1px solid var(--border)",
+                        background: "var(--bg)",
+                        color: "var(--text-muted)",
+                        fontSize: 11,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {d.notes.trim() ? "Edit note" : "Add note"}
+                    </button>
+                  )}
+                </div>
+
+                {selectedOption?.preview && (
+                  <div
+                    style={{
+                      border: "1px solid var(--border)",
+                      borderRadius: 7,
+                      padding: 10,
+                      background: "var(--bg-panel)",
+                      overflow: "auto",
+                      maxHeight: 280,
+                    }}
+                  >
+                    <div
+                      style={{
+                        fontSize: 11,
+                        color: "var(--text-dim)",
+                        marginBottom: 6,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.04em",
+                      }}
+                    >
+                      Preview
+                    </div>
+                    <pre
+                      style={{
+                        margin: 0,
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                        fontFamily: "var(--font-mono)",
+                        fontSize: 12,
+                        lineHeight: 1.5,
+                        color: "var(--text)",
+                      }}
+                    >
+                      {selectedOption.preview}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650 }}>Review your answers</div>
+              {questions.map((question, i) => {
+                const answered = isQuestionAnswered(question, drafts[i]);
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      padding: 10,
+                      borderRadius: 7,
+                      border: "1px solid var(--border)",
+                      background: "var(--bg-panel)",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                      <span style={{ fontWeight: 600, fontSize: 13, lineHeight: 1.45 }}>
+                        {question.header ? `${question.header}. ` : `Q${i + 1}. `}
+                        {question.question}
+                      </span>
+                      {answered ? (
+                        <span style={{ color: "#2ecc71", fontSize: 12, whiteSpace: "nowrap" }}>✓ answered</span>
+                      ) : (
+                        <span style={{ color: "#e5a50a", fontSize: 12, whiteSpace: "nowrap" }}>unanswered</span>
+                      )}
+                    </div>
+                    {answered && (
+                      <div style={{ color: "var(--text-muted)", fontSize: 12, marginTop: 4, lineHeight: 1.5 }}>
+                        {answerSummary(question, drafts[i])}
+                      </div>
+                    )}
+                    {!answered && (
+                      <button
+                        onClick={() => setTab(i)}
+                        style={{
+                          marginTop: 6,
+                          padding: "3px 8px",
+                          borderRadius: 5,
+                          border: "1px solid var(--border)",
+                          background: "var(--bg)",
+                          color: "var(--accent)",
+                          fontSize: 11,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Answer now
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+              {unansweredCount > 0 && (
+                <div style={{ color: "#e5a50a", fontSize: 12 }}>
+                  {unansweredCount} question{unansweredCount > 1 ? "s" : ""} still unanswered — you can submit anyway.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 8,
+            padding: "10px 14px",
+            borderTop: "1px solid var(--border)",
+            background: "var(--bg-panel)",
+          }}
+        >
+          <button
+            onClick={cancel}
+            style={{
+              padding: "6px 10px",
+              borderRadius: 6,
+              border: "1px solid var(--border)",
+              background: "var(--bg)",
+              color: "var(--text-muted)",
+              cursor: "pointer",
+            }}
+          >
+            Cancel (Esc)
+          </button>
+          {isMulti ? (
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                onClick={() => setTab(Math.max(0, tab - 1))}
+                disabled={tab === 0}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 6,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg)",
+                  color: "var(--text)",
+                  cursor: tab === 0 ? "default" : "pointer",
+                  opacity: tab === 0 ? 0.5 : 1,
+                }}
+              >
+                Back
+              </button>
+              {tab < questions.length - 1 ? (
+                <button
+                  onClick={() => setTab(tab + 1)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid var(--accent)",
+                    background: "var(--accent)",
+                    color: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  Next
+                </button>
+              ) : tab === questions.length ? (
+                <button
+                  onClick={submit}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid var(--accent)",
+                    background: "var(--accent)",
+                    color: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  Submit answers
+                </button>
+              ) : (
+                <button
+                  onClick={() => setTab(questions.length)}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 6,
+                    border: "1px solid var(--accent)",
+                    background: "var(--accent)",
+                    color: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  Review
+                </button>
+              )}
+            </div>
+          ) : (
+            <button
+              onClick={submit}
+              style={{
+                padding: "6px 10px",
+                borderRadius: 6,
+                border: "1px solid var(--accent)",
+                background: "var(--accent)",
+                color: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Submit
+            </button>
+          )}
         </div>
       </div>
     </div>
