@@ -655,7 +655,6 @@ export function ChatWindow({
                     </div>
                   )}
                   <ExtensionStatusBar statuses={extensionStatuses} />
-                  <ExtensionWidgets widgets={aboveEditorWidgets} />
 
                   {(() => {
                     const toolResultsMap = new Map<string, ToolResultMessage>();
@@ -923,6 +922,16 @@ export function ChatWindow({
         style={{ maxWidth: "var(--chat-content-max-width)" }}
         data-position={isEmptyNew ? "welcome" : "conversation"}
       >
+        {!isEmptyNew && aboveEditorWidgets.length > 0 && (
+          <div
+            style={{
+              padding: `0 ${CHAT_COLUMN_PADDING}px`,
+              paddingRight: isMobile ? CHAT_COLUMN_PADDING : CHAT_INPUT_RIGHT_PADDING,
+            }}
+          >
+            <ExtensionWidgets widgets={aboveEditorWidgets} />
+          </div>
+        )}
         {!isEmptyNew && belowEditorWidgets.length > 0 && (
           <div
             style={{
@@ -972,46 +981,78 @@ function ExtensionStatusBar({ statuses }: { statuses: Array<{ key: string; text:
 }
 
 function ExtensionWidgets({ widgets }: { widgets: Array<{ key: string; lines: string[] }> }) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   if (widgets.length === 0) return null;
+  const toggleCollapsed = (key: string) => setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
-      {widgets.map((widget) => (
-        <div
-          key={widget.key}
-          style={{
-            border: "1px solid var(--border)",
-            borderRadius: 7,
-            background: "var(--bg-panel)",
-            overflow: "hidden",
-          }}
-        >
+      {widgets.map((widget) => {
+        const isCollapsed = collapsed[widget.key] === true;
+        const displayLines = isCollapsed ? widget.lines.slice(0, 1) : widget.lines;
+        return (
           <div
+            key={widget.key}
             style={{
-              padding: "5px 9px",
-              borderBottom: "1px solid var(--border)",
-              color: "var(--text-dim)",
-              fontSize: 11,
-              fontFamily: "var(--font-mono)",
+              border: "1px solid var(--border)",
+              borderRadius: 7,
+              background: "var(--bg-panel)",
+              overflow: "hidden",
             }}
           >
-            {widget.key}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 12,
+                padding: "5px 9px",
+                borderBottom: "1px solid var(--border)",
+                color: "var(--text-dim)",
+                fontSize: 11,
+                fontFamily: "var(--font-mono)",
+              }}
+            >
+              <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                {widget.key}
+              </span>
+              <button
+                type="button"
+                title={isCollapsed ? "Expand" : "Collapse"}
+                aria-label={isCollapsed ? "Expand" : "Collapse"}
+                onClick={() => toggleCollapsed(widget.key)}
+                style={{
+                  padding: "3px 8px",
+                  borderRadius: 6,
+                  border: "1px solid var(--border)",
+                  background: "var(--bg-panel)",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                  fontSize: 11,
+                  flexShrink: 0,
+                }}
+              >
+                {isCollapsed ? "＋" : "－"}
+              </button>
+            </div>
+            {displayLines.length > 0 && (
+              <pre
+                style={{
+                  margin: 0,
+                  padding: "8px 9px",
+                  color: "var(--text-muted)",
+                  fontSize: 12,
+                  lineHeight: 1.5,
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                  fontFamily: "var(--font-mono)",
+                }}
+              >
+                {displayLines.join("\n")}
+              </pre>
+            )}
           </div>
-          <pre
-            style={{
-              margin: 0,
-              padding: "8px 9px",
-              color: "var(--text-muted)",
-              fontSize: 12,
-              lineHeight: 1.5,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            {widget.lines.join("\n")}
-          </pre>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
