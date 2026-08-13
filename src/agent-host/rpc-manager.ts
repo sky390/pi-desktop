@@ -69,11 +69,15 @@ type ActiveWidget = {
  * (e.g. rpiv-todo uses fg/bold/strikethrough).
  */
 const MINIMAL_WIDGET_THEME = {
-  // rpiv-todo's status glyphs (U+25D0 in-progress, U+2713 completed) render
-  // noticeably smaller than the U+25CB pending circle in common monospace
-  // fonts. Map them onto the same circle family (U+25C9, U+25CF) so all
-  // three status icons keep a consistent visual size.
-  fg: (_color: string, text: string) => text.replace(/\u25d0/g, "\u25c9").replace(/\u2713/g, "\u25cf"),
+  // rpiv-todo's status glyphs (U+25CB pending, U+25D0 in-progress, U+2713
+  // completed) are mapped to emoji so all three states stay visually
+  // distinct and consistent in size: pending U+23F3, in-progress U+1F9E0,
+  // completed U+2728.
+  fg: (_color: string, text: string) =>
+    text
+      .replace(/\u25cb/g, "\u23f3")
+      .replace(/\u25d0/g, "\ud83e\udde0")
+      .replace(/\u2713/g, "\u2728"),
   bg: (_color: string, text: string) => text,
   bold: (text: string) => text,
   strikethrough: (text: string) => text,
