@@ -827,6 +827,15 @@ export class AgentSessionWrapper {
 
   destroy(): void {
     if (!this._alive) return;
+    // Emit session_shutdown BEFORE marking the session dead: extension modules
+    // are process-global singletons (jiti-cached), so a destroyed session that
+    // owned the shared foreground pointer (rpiv-todo's activeRenderSession)
+    // and never released it would pin it forever — every later session's
+    // session_start fails to claim the foreground and its widget never renders
+    // (the exact symptom seen on fresh sessions). shutdownExtensions() runs its
+    // synchronous handler parts (pointer clear) before destroy() returns; the
+    // async tail (overlay dispose) completes in the background.
+    void this.shutdownExtensions().catch(() => {});
     this._alive = false;
     browserAgentRuntime.clearSession(this.sessionId);
     if (this.idleTimer) clearTimeout(this.idleTimer);
