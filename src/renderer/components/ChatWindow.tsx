@@ -1002,6 +1002,7 @@ function ExtensionWidgets({ widgets }: { widgets: Array<{ key: string; lines: st
           <div
             key={widget.key}
             style={{
+              width: "100%",
               border: "1px solid var(--border)",
               borderRadius: 7,
               background: "var(--bg-panel)",
