@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { createManualScheduler } from "#test-timing";
 
 import { BrowserNetworkRecorder } from "./browser-network-recorder.ts";
 
@@ -188,16 +189,15 @@ test("network recorder suspends body and sealed replay capture after idle while 
   const directory = mkdtempSync(path.join(os.tmpdir(), "pi-browser-body-idle-"));
   try {
     const cdp = new FakeCdp();
+    const scheduler = createManualScheduler();
     const recorder = new BrowserNetworkRecorder({
       tabId: "tab-1",
       cdp,
       bodyDirectory: directory,
       maxRequests: () => 50,
       maxBodyBytes: () => 1024 * 1024,
-      // Keep the idle window comfortably above the synchronous + setImmediate
-      // work of the active-capture phase; on loaded machines 25ms races the
-      // body read and flakes the "rearmed" capture below.
-      bodyCaptureIdleMs: 250,
+      bodyCaptureIdleMs: 25,
+      timers: scheduler,
     });
     await recorder.start();
     recorder.armBodyCapture();
@@ -217,7 +217,7 @@ test("network recorder suspends body and sealed replay capture after idle while 
     assert.equal(recorder.getRequest(active.requestId).bodyAvailable, true);
     assert.equal(recorder.getSealedReplayRecord(active.requestId).method, "POST");
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await scheduler.runNext();
     assert.equal(recorder.count(), 1, "request metadata remains available after payload capture idles");
     assert.equal(recorder.getRequest(active.requestId).bodyAvailable, false);
     assert.throws(

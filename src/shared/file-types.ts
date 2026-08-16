@@ -1,6 +1,7 @@
 export const TEXT_PREVIEW_MAX_BYTES = 256 * 1024;
 export const IMAGE_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
 export const DOCX_PREVIEW_MAX_BYTES = 10 * 1024 * 1024;
+export const FILE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024;
 
 export type DocumentPreviewKind = "pdf" | "docx";
 
@@ -39,7 +40,10 @@ function getBaseName(filePath: string): string {
 }
 
 export function getFileExt(filePath: string): string {
-  return getBaseName(filePath).toLowerCase().split(".").pop() ?? "";
+  const baseName = getBaseName(filePath).toLowerCase();
+  const dotIndex = baseName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === baseName.length - 1) return "";
+  return baseName.slice(dotIndex + 1);
 }
 
 export function getImageMime(filePath: string): string | null {

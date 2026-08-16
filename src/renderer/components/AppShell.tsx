@@ -1,10 +1,10 @@
 import { call, listSessions, subscribe } from "@/lib/api-client";
 import {
   useState,
+  useReducer,
   useCallback,
   useRef,
   useEffect,
-  useSyncExternalStore,
   type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -13,7 +13,7 @@ import { SessionSidebar } from "./SessionSidebar";
 import { ChatWindow } from "./ChatWindow";
 import { FileExplorer } from "./FileExplorer";
 import { FileViewer } from "./FileViewer";
-import { TabBar, type Tab } from "./TabBar";
+import { TabBar } from "./TabBar";
 import { SettingsConfig, type SettingsTab } from "./SettingsConfig";
 import { QuickChannelBinding } from "./channels/QuickChannelBinding";
 import { BrowserDock } from "./browser/BrowserDock";
@@ -24,7 +24,10 @@ import { useI18n } from "@/i18n";
 import { copyText } from "@/lib/clipboard";
 import { getFileName } from "@/lib/file-paths";
 import { getSessionDisplayTitle } from "@/lib/session-list";
+import { formatCompactNumber, formatNumber } from "@/lib/locale-format";
 import { beginSessionLoadTrace } from "@/lib/session-performance";
+import { reduceFileTabState } from "@/lib/file-tab-state";
+import { readSessionIdFromSearch, routerCompat } from "@/lib/router-compat";
 import { SessionProfiler } from "./SessionProfiler";
 import { buildAtMentionText } from "@/lib/file-fuzzy";
 import {
@@ -45,6 +48,7 @@ import type { ChannelsSnapshot } from "@shared/channel-types";
 import type { BrowserAgentAuthorizationRequest, BrowserAgentAuthorizationDecision } from "../../contract/browser";
 
 type SessionCopyField = "file" | "id";
+type SessionCopyFeedback = { field: SessionCopyField; status: "copied" | "error" };
 const EXPLORER_TAB_ID = "explorer";
 const BROWSER_TAB_ID = "browser";
 const BROWSER_PANEL_WIDTH_KEY = "pi-desktop.browser-panel-width";
@@ -76,30 +80,8 @@ function loadBrowserPanelPreferredWidth(): number {
   }
 }
 
-function useSearchParamsCompat() {
-  const subscribe = (cb: () => void) => {
-    window.addEventListener("popstate", cb);
-    return () => window.removeEventListener("popstate", cb);
-  };
-  const get = () => window.location.search;
-  const search = useSyncExternalStore(subscribe, get, () => "");
-  return new URLSearchParams(search);
-}
-
-function useRouterCompat() {
-  return {
-    replace: (url: string, _opts?: { scroll?: boolean }) => {
-      const next = url.startsWith("?") || url.startsWith("/") ? url : `?${url}`;
-      const full = next.startsWith("?") ? `${window.location.pathname}${next}` : next;
-      window.history.replaceState(null, "", full === "/" ? "/" : full);
-      window.dispatchEvent(new Event("popstate"));
-    },
-  };
-}
-
 export function AppShell() {
-  const router = useRouterCompat();
-  const searchParams = useSearchParamsCompat();
+  const router = routerCompat;
   const { isDark, toggleTheme } = useTheme();
   const { language, t } = useI18n();
   const isMobile = useIsMobile();
@@ -165,14 +147,20 @@ export function AppShell() {
   const handleSessionStatsChange = useCallback((stats: SessionStatsInfo | null) => {
     setSessionStats(stats);
   }, []);
-  const [copiedSessionField, setCopiedSessionField] = useState<SessionCopyField | null>(null);
+  const [sessionCopyFeedback, setSessionCopyFeedback] = useState<SessionCopyFeedback | null>(null);
   const sessionCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleCopySessionField = useCallback((field: SessionCopyField, value: string) => {
-    void copyText(value).then(() => {
-      if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
-      setCopiedSessionField(field);
-      sessionCopyTimerRef.current = setTimeout(() => setCopiedSessionField(null), 1400);
-    });
+    if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
+    setSessionCopyFeedback(null);
+    void copyText(value)
+      .then(() => {
+        setSessionCopyFeedback({ field, status: "copied" });
+        sessionCopyTimerRef.current = setTimeout(() => setSessionCopyFeedback(null), 1_400);
+      })
+      .catch(() => {
+        setSessionCopyFeedback({ field, status: "error" });
+        sessionCopyTimerRef.current = setTimeout(() => setSessionCopyFeedback(null), 3_000);
+      });
   }, []);
 
   useEffect(() => {
@@ -212,8 +200,10 @@ export function AppShell() {
   }, [isMobile]);
 
   // Right panel — file tabs only
-  const [fileTabs, setFileTabs] = useState<Tab[]>([]);
-  const [activeFileTabId, setActiveFileTabId] = useState<string | null>(EXPLORER_TAB_ID);
+  const [{ tabs: fileTabs, activeTabId: activeFileTabId }, dispatchFileTab] = useReducer(reduceFileTabState, {
+    tabs: [],
+    activeTabId: EXPLORER_TAB_ID,
+  });
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [rightPanelBounds, setRightPanelBounds] = useState(() =>
     getRightPanelWidthBounds(window.innerWidth, sidebarOpen),
@@ -315,7 +305,7 @@ export function AppShell() {
   useEffect(() => {
     const openBrowserTab = (event: Event) => {
       const tabId = (event as CustomEvent<{ tabId?: string }>).detail?.tabId;
-      setActiveFileTabId(BROWSER_TAB_ID);
+      dispatchFileTab({ type: "select", tabId: BROWSER_TAB_ID });
       openRightPanel();
       if (tabId) void window.piBridge.browserActivateTab(tabId).catch(() => undefined);
     };
@@ -329,7 +319,7 @@ export function AppShell() {
         if (event.type !== "tab-created" || !event.tab.ownerSessionId) return;
         void window.piBridge.browserGetSettings().then((settings) => {
           if (!settings.settings.panel.openOnAgentUse) return;
-          setActiveFileTabId(BROWSER_TAB_ID);
+          dispatchFileTab({ type: "select", tabId: BROWSER_TAB_ID });
           openRightPanel();
         });
       }),
@@ -394,10 +384,10 @@ export function AppShell() {
     chatInputRef.current?.insertText(buildAtMentionText(relativePath, isDir));
   }, []);
 
-  const [initialSessionId] = useState<string | null>(() => searchParams.get("session"));
+  const [initialSessionId] = useState<string | null>(() => readSessionIdFromSearch(window.location.search));
   const [activeCwd, setActiveCwd] = useState<string | null>(null);
   // True once the initial ?session= URL param has been resolved (or confirmed absent)
-  const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !searchParams.get("session"));
+  const [initialSessionRestored, setInitialSessionRestored] = useState<boolean>(() => !initialSessionId);
   // Suppresses sessionKey bump in handleCwdChange during the initial URL restore
   const suppressCwdBumpRef = useRef(false);
 
@@ -609,13 +599,10 @@ export function AppShell() {
   const handleOpenFile = useCallback(
     (filePath: string, fileName: string, sourceSessionId?: string | null) => {
       const tabId = `file:${filePath}`;
-      setFileTabs((prev) => {
-        const existing = prev.find((t) => t.id === tabId);
-        if (!existing) return [...prev, { id: tabId, label: fileName, filePath, sourceSessionId }];
-        if (!sourceSessionId || existing.sourceSessionId === sourceSessionId) return prev;
-        return prev.map((t) => (t.id === tabId ? { ...t, sourceSessionId } : t));
+      dispatchFileTab({
+        type: "open",
+        tab: { id: tabId, label: fileName, filePath, sourceSessionId },
       });
-      setActiveFileTabId(tabId);
       openRightPanel();
     },
     [openRightPanel],
@@ -628,21 +615,15 @@ export function AppShell() {
     [handleOpenFile, selectedSession?.id],
   );
 
-  const handleCloseFileTab = useCallback(
-    (tabId: string) => {
-      setFileTabs((prev) => {
-        const next = prev.filter((t) => t.id !== tabId);
-        if (next.length === 0) setRightPanelOpen(false);
-        return next;
-      });
-      setActiveFileTabId((cur) => {
-        if (cur !== tabId) return cur;
-        const remaining = fileTabs.filter((t) => t.id !== tabId);
-        return remaining.length > 0 ? remaining[remaining.length - 1].id : EXPLORER_TAB_ID;
-      });
-    },
-    [fileTabs],
-  );
+  const handleCloseFileTab = useCallback((tabId: string) => {
+    dispatchFileTab({ type: "close", tabId, fallbackTabId: EXPLORER_TAB_ID });
+  }, []);
+
+  const previousFileTabCountRef = useRef(fileTabs.length);
+  useEffect(() => {
+    if (previousFileTabCountRef.current > 0 && fileTabs.length === 0) setRightPanelOpen(false);
+    previousFileTabCountRef.current = fileTabs.length;
+  }, [fileTabs.length]);
 
   // Show chat area if a session is selected, or if we have a cwd to start a new session in
   const effectiveNewSessionCwd = newSessionCwd ?? (selectedSession === null && activeCwd ? activeCwd : null);
@@ -655,7 +636,7 @@ export function AppShell() {
 
   useEffect(() => {
     if (!activeCwd || isMobile) return;
-    setActiveFileTabId(EXPLORER_TAB_ID);
+    dispatchFileTab({ type: "select", tabId: EXPLORER_TAB_ID });
   }, [activeCwd, isMobile]);
 
   const sidebarContent = (
@@ -1167,12 +1148,12 @@ export function AppShell() {
                           [t("usageInput", "Input"), sessionStats.tokens.input.toLocaleString(language)],
                           [t("usageOutput", "Output"), sessionStats.tokens.output.toLocaleString(language)],
                           ...(sessionStats.tokens.cacheRead > 0
-                            ? [[t("cacheRead", "Cache Read"), sessionStats.tokens.cacheRead.toLocaleString(language)]]
+                            ? [[t("cacheRead", "Cache read"), sessionStats.tokens.cacheRead.toLocaleString(language)]]
                             : []),
                           ...(sessionStats.tokens.cacheWrite > 0
                             ? [
                                 [
-                                  t("cacheWrite", "Cache Write"),
+                                  t("cacheWrite", "Cache write"),
                                   sessionStats.tokens.cacheWrite.toLocaleString(language),
                                 ],
                               ]
@@ -1180,12 +1161,6 @@ export function AppShell() {
                           [t("total", "Total"), sessionStats.tokens.total.toLocaleString(language)],
                         ];
                         const ctx = contextUsage ?? sessionStats.contextUsage;
-                        const formatCompact = (n: number) =>
-                          n >= 1_000_000
-                            ? `${(n / 1_000_000).toFixed(1)}M`
-                            : n >= 1000
-                              ? `${(n / 1000).toFixed(0)}k`
-                              : String(n);
                         const extraTokenRows = [
                           ...(sessionStats.cost > 0
                             ? [[t("usageCost", "Cost"), `$${sessionStats.cost.toFixed(4)}`]]
@@ -1194,7 +1169,7 @@ export function AppShell() {
                             ? [
                                 [
                                   t("usageContext", "Context"),
-                                  `${ctx.percent !== null ? `${ctx.percent.toFixed(1)}%` : "?"} / ${formatCompact(ctx.contextWindow)}`,
+                                  `${ctx.percent !== null ? `${ctx.percent.toFixed(1)}%` : "?"} / ${formatCompactNumber(ctx.contextWindow, language)}`,
                                 ],
                               ]
                             : []),
@@ -1238,17 +1213,23 @@ export function AppShell() {
                           </div>
                         );
                         const copyButton = (field: SessionCopyField, value: string) => {
-                          const copied = copiedSessionField === field;
+                          const feedback = sessionCopyFeedback?.field === field ? sessionCopyFeedback.status : null;
+                          const copied = feedback === "copied";
+                          const failed = feedback === "error";
+                          const defaultLabel =
+                            field === "file"
+                              ? t("copyFilePath", "Copy file path")
+                              : t("copySessionId", "Copy session ID");
+                          const label = copied
+                            ? t("copied", "Copied")
+                            : failed
+                              ? t("copyFailed", "Copy failed")
+                              : defaultLabel;
                           return (
                             <button
                               type="button"
-                              title={
-                                copied
-                                  ? t("copied", "Copied")
-                                  : field === "file"
-                                    ? t("copyFilePath", "Copy file path")
-                                    : t("copySessionId", "Copy session ID")
-                              }
+                              title={label}
+                              aria-label={label}
                               onClick={() => handleCopySessionField(field, value)}
                               style={{
                                 alignSelf: "start",
@@ -1258,7 +1239,7 @@ export function AppShell() {
                                 width: 22,
                                 height: 22,
                                 marginTop: -2,
-                                color: copied ? "var(--accent)" : "var(--text-dim)",
+                                color: failed ? "var(--error, #ef4444)" : copied ? "var(--accent)" : "var(--text-dim)",
                                 background: "transparent",
                                 border: "1px solid var(--border)",
                                 borderRadius: 4,
@@ -1272,12 +1253,31 @@ export function AppShell() {
                                 e.currentTarget.style.background = "var(--bg-hover)";
                               }}
                               onMouseLeave={(e) => {
-                                e.currentTarget.style.color = copied ? "var(--accent)" : "var(--text-dim)";
+                                e.currentTarget.style.color = failed
+                                  ? "var(--error, #ef4444)"
+                                  : copied
+                                    ? "var(--accent)"
+                                    : "var(--text-dim)";
                                 e.currentTarget.style.borderColor = "var(--border)";
                                 e.currentTarget.style.background = "transparent";
                               }}
                             >
-                              {copied ? (
+                              {failed ? (
+                                <svg
+                                  width="12"
+                                  height="12"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="2"
+                                  strokeLinecap="round"
+                                  aria-hidden="true"
+                                >
+                                  <circle cx="12" cy="12" r="9" />
+                                  <line x1="12" y1="7" x2="12" y2="13" />
+                                  <line x1="12" y1="17" x2="12" y2="17" />
+                                </svg>
+                              ) : copied ? (
                                 <svg
                                   width="12"
                                   height="12"
@@ -1313,7 +1313,7 @@ export function AppShell() {
                         const sessionInfoSection = (
                           <div style={{ minWidth: 0 }}>
                             <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text)", marginBottom: 6 }}>
-                              {t("sessionInfo", "Session Info")}
+                              {t("sessionInfo", "Session info")}
                             </div>
                             <div
                               style={{
@@ -1342,6 +1342,12 @@ export function AppShell() {
                                 </div>
                               ))}
                             </div>
+                            {sessionCopyFeedback?.status === "error" && (
+                              <div role="alert" style={{ marginTop: 8, color: "var(--error, #ef4444)" }}>
+                                {t("copyFailed", "Copy failed")}.{" "}
+                                {t("checkClipboardPermission", "Check clipboard permission and retry.")}
+                              </div>
+                            )}
                           </div>
                         );
 
@@ -1360,7 +1366,7 @@ export function AppShell() {
                           >
                             {sessionInfoSection}
                             {section(t("messages", "Messages"), messageRows)}
-                            {section(t("tokens", "Tokens"), [...tokenRows, ...extraTokenRows], "right", true)}
+                            {section(t("tokenStatistics", "Tokens"), [...tokenRows, ...extraTokenRows], "right", true)}
                           </div>
                         );
                       })()
@@ -1474,7 +1480,10 @@ export function AppShell() {
             aria-valuemin={rightPanelBounds.minWidth}
             aria-valuemax={rightPanelBounds.maxWidth}
             aria-valuenow={Math.round(rightPanelWidth)}
-            aria-valuetext={`${Math.round(rightPanelWidth)} pixels`}
+            aria-valuetext={t("rightPanelWidthPixels", "{width} pixels").replace(
+              "{width}",
+              formatNumber(Math.round(rightPanelWidth), language),
+            )}
             tabIndex={isMobile ? -1 : 0}
             onPointerDown={handleRightPanelResizeStart}
             onKeyDown={handleRightPanelResizeKeyDown}
@@ -1494,7 +1503,7 @@ export function AppShell() {
           >
             <button
               type="button"
-              onClick={() => setActiveFileTabId(EXPLORER_TAB_ID)}
+              onClick={() => dispatchFileTab({ type: "select", tabId: EXPLORER_TAB_ID })}
               aria-pressed={activeFileTabId === EXPLORER_TAB_ID}
               style={{
                 display: "flex",
@@ -1525,11 +1534,11 @@ export function AppShell() {
               >
                 <path d="M3 5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
               </svg>
-              Explorer
+              {t("explorer", "Explorer")}
             </button>
             <button
               type="button"
-              onClick={() => setActiveFileTabId(BROWSER_TAB_ID)}
+              onClick={() => dispatchFileTab({ type: "select", tabId: BROWSER_TAB_ID })}
               aria-pressed={activeFileTabId === BROWSER_TAB_ID}
               style={{
                 display: "flex",
@@ -1561,13 +1570,13 @@ export function AppShell() {
                 <circle cx="12" cy="12" r="9" />
                 <path d="M3 12h18M12 3a15 15 0 0 1 0 18M12 3a15 15 0 0 0 0 18" />
               </svg>
-              Browser
+              {t("browser", "Browser")}
             </button>
             <div style={{ flex: 1, overflow: "hidden" }}>
               <TabBar
                 tabs={fileTabs}
-                activeTabId={activeFileTabId ?? ""}
-                onSelectTab={setActiveFileTabId}
+                activeTabId={activeFileTabId}
+                onSelectTab={(tabId) => dispatchFileTab({ type: "select", tabId })}
                 onCloseTab={handleCloseFileTab}
               />
             </div>
@@ -1647,7 +1656,7 @@ export function AppShell() {
                     fontSize: 12,
                   }}
                 >
-                  Select a project to browse files
+                  {t("selectProjectToBrowseFiles", "Select a project to browse files")}
                 </div>
               )
             ) : activeFileTab?.filePath ? (
@@ -1668,7 +1677,7 @@ export function AppShell() {
                   fontSize: 12,
                 }}
               >
-                Select Browser, Explorer or open a file
+                {t("selectRightPanelContent", "Select Browser, Explorer or open a file")}
               </div>
             )}
           </div>

@@ -11,10 +11,10 @@ import { appendMainLog } from "./logger";
 const CSP =
   "default-src 'self' app:; " +
   "script-src 'self' app:; " +
-  "style-src 'self' app: https://fonts.googleapis.com https://cdn.jsdelivr.net; " +
-  "style-src-elem 'self' app: 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; " +
+  "style-src 'self' app:; " +
+  "style-src-elem 'self' app: 'unsafe-inline'; " +
   "style-src-attr 'unsafe-inline'; " +
-  "font-src 'self' app: data: https://fonts.gstatic.com https://cdn.jsdelivr.net; " +
+  "font-src 'self' app: data:; " +
   "img-src 'self' app: data: blob: https:; " +
   "media-src 'self' app: blob: data:; " +
   "connect-src 'self' app:; " +
@@ -39,19 +39,50 @@ const HTML_PREVIEW_CSP =
 
 const HTML_PREVIEW_MAX_BYTES = 1024 * 1024;
 const HTML_PREVIEW_ASSET_MAX_BYTES = 20 * 1024 * 1024;
+export const HTML_PREVIEW_TTL_MS = 30 * 60 * 1000;
+export const HTML_PREVIEW_MAX_ENTRIES = 64;
 
 type HtmlPreviewEntry = {
   content: string;
   filePath: string;
   loadAsset: (filePath: string) => Promise<{ base64: string; size: number; mime?: string }>;
+  ownerId: number | null;
+  expiresAt: number;
 };
 
 const htmlPreviews = new Map<string, HtmlPreviewEntry>();
+
+export function pruneHtmlPreviews(now = Date.now()): void {
+  for (const [token, preview] of htmlPreviews) {
+    if (preview.expiresAt <= now) htmlPreviews.delete(token);
+  }
+}
+
+export function releaseHtmlPreviewsForOwner(ownerId: number): void {
+  for (const [token, preview] of htmlPreviews) {
+    if (preview.ownerId === ownerId) htmlPreviews.delete(token);
+  }
+}
+
+function getHtmlPreview(token: string): HtmlPreviewEntry | undefined {
+  const now = Date.now();
+  pruneHtmlPreviews(now);
+  const preview = htmlPreviews.get(token);
+  if (!preview) return undefined;
+  preview.expiresAt = now + HTML_PREVIEW_TTL_MS;
+  htmlPreviews.delete(token);
+  htmlPreviews.set(token, preview);
+  return preview;
+}
+
+const htmlPreviewSweep = setInterval(pruneHtmlPreviews, 60_000);
+htmlPreviewSweep.unref();
 
 export function createHtmlPreviewUrl(
   content: string,
   filePath: string,
   loadAsset: HtmlPreviewEntry["loadAsset"],
+  ownerId: number | null = null,
 ): string {
   if (
     typeof content !== "string" ||
@@ -61,8 +92,15 @@ export function createHtmlPreviewUrl(
   ) {
     throw new Error("HTML preview is too large");
   }
+  const now = Date.now();
+  pruneHtmlPreviews(now);
+  while (htmlPreviews.size >= HTML_PREVIEW_MAX_ENTRIES) {
+    const oldestToken = htmlPreviews.keys().next().value;
+    if (typeof oldestToken !== "string") break;
+    htmlPreviews.delete(oldestToken);
+  }
   const token = randomUUID();
-  htmlPreviews.set(token, { content, filePath, loadAsset });
+  htmlPreviews.set(token, { content, filePath, loadAsset, ownerId, expiresAt: now + HTML_PREVIEW_TTL_MS });
   return `app://preview/${token}/index.html`;
 }
 
@@ -75,6 +113,24 @@ export function releaseHtmlPreviewUrl(previewUrl: string): void {
   } catch {
     /* ignore malformed preview URLs */
   }
+}
+
+export function resolveHtmlPreviewAssetPath(filePath: string, encodedPath: string): string | null {
+  let relativePath: string;
+  try {
+    relativePath = decodeURIComponent(encodedPath);
+  } catch {
+    return null;
+  }
+  if (!relativePath || path.isAbsolute(relativePath)) return null;
+
+  const previewDirectory = path.resolve(path.dirname(filePath));
+  const assetPath = path.resolve(previewDirectory, relativePath);
+  const containment = path.relative(previewDirectory, assetPath);
+  if (!containment || containment === ".." || containment.startsWith(`..${path.sep}`) || path.isAbsolute(containment)) {
+    return null;
+  }
+  return assetPath;
 }
 
 const MIME: Record<string, string> = {
@@ -116,7 +172,7 @@ export function handleAppProtocol(rendererRoot: string): void {
       const url = new URL(request.url);
       if (url.hostname === "preview") {
         const [token, ...assetSegments] = url.pathname.split("/").filter(Boolean);
-        const preview = token ? htmlPreviews.get(token) : undefined;
+        const preview = token ? getHtmlPreview(token) : undefined;
         if (!preview) return new Response("Not Found", { status: 404 });
 
         if (assetSegments.join("/") === "index.html") {
@@ -131,8 +187,8 @@ export function handleAppProtocol(rendererRoot: string): void {
           });
         }
 
-        const relativePath = decodeURIComponent(assetSegments.join("/"));
-        const assetPath = path.resolve(path.dirname(preview.filePath), relativePath);
+        const assetPath = resolveHtmlPreviewAssetPath(preview.filePath, assetSegments.join("/"));
+        if (!assetPath) return new Response("Forbidden", { status: 403 });
         const asset = await preview.loadAsset(assetPath);
         if (asset.size > HTML_PREVIEW_ASSET_MAX_BYTES) {
           return new Response("Asset too large", { status: 413 });

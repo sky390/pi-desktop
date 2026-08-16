@@ -1,9 +1,9 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTheme } from "@/hooks/useTheme";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n, type AppLanguage } from "@/i18n";
 import { ModelsConfig } from "./ModelsConfig";
-import { SkillsConfig } from "./SkillsConfig";
+import { SkillsConfig, type SkillsConfigHandle } from "./SkillsConfig";
 import { PluginsConfig } from "./PluginsConfig";
 import { ToolchainsConfig } from "./ToolchainsConfig";
 import { BrowserSettings } from "./browser/BrowserSettings";
@@ -41,15 +41,27 @@ export function SettingsConfig({
   const { isDark, toggleTheme } = useTheme();
   const { language, setLanguage, t } = useI18n();
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const skillsConfigRef = useRef<SkillsConfigHandle>(null);
   const returnFocusRef = useRef<HTMLElement | null>(
     document.activeElement instanceof HTMLElement ? document.activeElement : null,
   );
 
+  const requestSettingsTransition = useCallback((action: () => void) => {
+    if (activeTabRef.current === "skills" && skillsConfigRef.current) {
+      skillsConfigRef.current.requestLeave(action);
+      return;
+    }
+    action();
+  }, []);
+
   useEffect(() => {
-    setActiveTab(initialTab);
-  }, [initialTab, navigationRequestId]);
+    if (initialTab !== activeTabRef.current) requestSettingsTransition(() => setActiveTab(initialTab));
+    // navigationRequestId intentionally retries an externally requested tab after a cancelled dirty-editor prompt.
+  }, [initialTab, navigationRequestId, requestSettingsTransition]);
 
   useEffect(() => {
     const returnFocus = returnFocusRef.current;
@@ -90,7 +102,7 @@ export function SettingsConfig({
         justifyContent: "center",
       }}
       onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) requestSettingsTransition(onClose);
       }}
     >
       <div
@@ -101,7 +113,7 @@ export function SettingsConfig({
         onKeyDown={(event) => {
           if (event.key === "Escape") {
             event.preventDefault();
-            onClose();
+            requestSettingsTransition(onClose);
             return;
           }
           if (event.key !== "Tab") return;
@@ -166,7 +178,7 @@ export function SettingsConfig({
           <button
             ref={closeButtonRef}
             type="button"
-            onClick={onClose}
+            onClick={() => requestSettingsTransition(onClose)}
             aria-label={t("close", "Close")}
             style={{
               background: "none",
@@ -216,7 +228,9 @@ export function SettingsConfig({
                   aria-selected={active}
                   aria-controls="settings-tabpanel"
                   tabIndex={active ? 0 : -1}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => {
+                    if (!active) requestSettingsTransition(() => setActiveTab(tab.id));
+                  }}
                   onKeyDown={(event) => {
                     const currentIndex = tabs.findIndex((item) => item.id === tab.id);
                     let nextIndex: number | undefined;
@@ -227,8 +241,10 @@ export function SettingsConfig({
                     if (nextIndex === undefined) return;
                     event.preventDefault();
                     const nextTab = tabs[nextIndex];
-                    setActiveTab(nextTab.id);
-                    document.getElementById(`settings-tab-${nextTab.id}`)?.focus();
+                    requestSettingsTransition(() => {
+                      setActiveTab(nextTab.id);
+                      document.getElementById(`settings-tab-${nextTab.id}`)?.focus();
+                    });
                   }}
                   style={{
                     position: "relative",
@@ -274,7 +290,11 @@ export function SettingsConfig({
             {activeTab === "tools" && <ToolchainsConfig cwd={cwd} />}
             {activeTab === "channels" && <ChannelsConfig onSnapshotChange={onChannelsChanged} />}
             {activeTab === "skills" &&
-              (cwd ? <SkillsConfig embedded cwd={cwd} onClose={() => undefined} /> : <ProjectRequired />)}
+              (cwd ? (
+                <SkillsConfig ref={skillsConfigRef} embedded cwd={cwd} onClose={() => undefined} />
+              ) : (
+                <ProjectRequired />
+              ))}
             {activeTab === "plugins" &&
               (cwd ? (
                 <PluginsConfig
@@ -661,7 +681,10 @@ function SoftwareUpdate({ onClose }: { onClose: () => void }) {
             disabled={!state || phase === "disabled" || isBusy}
             onChange={(event) => {
               const enabled = event.target.checked;
-              void performAction("automatic", () => window.piBridge.setAutomaticUpdateChecks(enabled));
+              void performAction("automatic", async () => {
+                const nextState = await window.piBridge.setAutomaticUpdateChecks(enabled);
+                setState(nextState);
+              });
             }}
             style={{ width: 18, height: 18, margin: 0, accentColor: "var(--accent)", cursor: "pointer" }}
           />
@@ -921,6 +944,7 @@ function GeneralSettings({
 }) {
   const { t } = useI18n();
   const [backgroundMode, setBackgroundMode] = useState(true);
+
   const [httpProxy, setHttpProxy] = useState("");
   const [httpsProxy, setHttpsProxy] = useState("");
   const [proxyLoading, setProxyLoading] = useState(true);
@@ -931,14 +955,33 @@ function GeneralSettings({
   const [proxyTesting, setProxyTesting] = useState(false);
   const [proxyTestOk, setProxyTestOk] = useState<boolean | null>(null);
   const [proxyTestMessage, setProxyTestMessage] = useState<string | null>(null);
+
+  const [backgroundModeLoading, setBackgroundModeLoading] = useState(true);
+  const [backgroundModeSaving, setBackgroundModeSaving] = useState(false);
+  const [backgroundModeError, setBackgroundModeError] = useState<"load" | "save" | null>(null);
   const languageControlId = useId();
   const backgroundModeControlId = useId();
   const themeControlId = useId();
   const httpProxyControlId = useId();
   const httpsProxyControlId = useId();
   useEffect(() => {
-    void window.piBridge.getUiState().then((state) => setBackgroundMode(state.backgroundMode !== false));
+    let disposed = false;
+    void window.piBridge
+      .getUiState()
+      .then((state) => {
+        if (!disposed) setBackgroundMode(state.backgroundMode !== false);
+      })
+      .catch(() => {
+        if (!disposed) setBackgroundModeError("load");
+      })
+      .finally(() => {
+        if (!disposed) setBackgroundModeLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
   }, []);
+
   useEffect(() => {
     let cancelled = false;
     fetch("/api/network-proxy")
@@ -1049,6 +1092,21 @@ function GeneralSettings({
       setProxyTesting(false);
     }
   };
+
+  const saveBackgroundMode = async (next: boolean): Promise<void> => {
+    const previous = backgroundMode;
+    setBackgroundMode(next);
+    setBackgroundModeSaving(true);
+    setBackgroundModeError(null);
+    try {
+      await window.piBridge.setUiState({ backgroundMode: next });
+    } catch {
+      setBackgroundMode(previous);
+      setBackgroundModeError("save");
+    } finally {
+      setBackgroundModeSaving(false);
+    }
+  };
   return (
     <div style={{ width: "100%", overflowY: "auto", padding: "28px clamp(18px, 5vw, 52px)" }}>
       <section style={{ maxWidth: 620 }}>
@@ -1094,15 +1152,27 @@ function GeneralSettings({
               id={backgroundModeControlId}
               type="checkbox"
               checked={backgroundMode}
+              disabled={backgroundModeLoading || backgroundModeSaving}
               onChange={(event) => {
-                const next = event.target.checked;
-                setBackgroundMode(next);
-                void window.piBridge.setUiState({ backgroundMode: next });
+                void saveBackgroundMode(event.target.checked);
               }}
-              style={{ width: 18, height: 18, margin: 0, accentColor: "var(--accent)", cursor: "pointer" }}
+              style={{
+                width: 18,
+                height: 18,
+                margin: 0,
+                accentColor: "var(--accent)",
+                cursor: backgroundModeLoading || backgroundModeSaving ? "not-allowed" : "pointer",
+              }}
             />
           </label>
         </SettingRow>
+        {backgroundModeError && (
+          <p role="alert" style={{ margin: "8px 0 0", fontSize: 12, lineHeight: 1.55, color: "#f87171" }}>
+            {backgroundModeError === "save"
+              ? t("backgroundModeSaveFailed", "Background mode could not be saved. The previous setting was restored.")
+              : t("backgroundModeLoadFailed", "Background mode could not be loaded. The default remains selected.")}
+          </p>
+        )}
       </section>
 
       <div style={{ height: 1, background: "var(--border)", maxWidth: 620, margin: "28px 0" }} />

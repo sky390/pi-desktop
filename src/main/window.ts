@@ -1,9 +1,19 @@
-import { BrowserWindow, shell } from "electron";
+import { BrowserWindow, nativeTheme, screen, shell } from "electron";
 import { appendMainLog } from "./logger";
 import { resolvePreloadPath, resolveRendererEntry } from "./host-manager";
+import { releaseHtmlPreviewsForOwner } from "./protocol";
+import { createLoadFailurePage, createRendererCrashPage, RENDERER_CRASH_RETRY_URL } from "./window-load-failure";
+import { isAllowedMainNavigation } from "./window-navigation-policy";
 import { applyWindowBounds, loadUiState, shouldMaximize, trackWindowState } from "./window-state";
+import { RendererCrashRecovery } from "./renderer-crash-recovery";
+import { installWindowShowFallback } from "./window-show-fallback";
 
-const BACKGROUND = "#f7f6f3";
+const LIGHT_BACKGROUND = "#f7f6f3";
+const DARK_BACKGROUND = "#141210";
+
+function currentTheme(): "light" | "dark" {
+  return nativeTheme.shouldUseDarkColors ? "dark" : "light";
+}
 
 export type CreateMainWindowOptions = {
   isDev: boolean;
@@ -18,10 +28,11 @@ export type CreateMainWindowOptions = {
 
 export function createMainWindow(options: CreateMainWindowOptions): BrowserWindow {
   const ui = loadUiState();
-  const bounds = applyWindowBounds(
-    { x: undefined as unknown as number, y: undefined as unknown as number, width: 1280, height: 840 },
-    ui,
-  );
+  const primaryWorkArea = screen.getPrimaryDisplay().workArea;
+  const bounds = applyWindowBounds({ width: 1280, height: 840 }, ui, {
+    primary: primaryWorkArea,
+    all: screen.getAllDisplays().map((display) => display.workArea),
+  });
 
   const win = new BrowserWindow({
     width: bounds.width,
@@ -31,7 +42,7 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
     minWidth: 900,
     minHeight: 600,
     title: "Pi Agent Desktop",
-    backgroundColor: BACKGROUND,
+    backgroundColor: nativeTheme.shouldUseDarkColors ? DARK_BACKGROUND : LIGHT_BACKGROUND,
     show: false,
     webPreferences: {
       preload: resolvePreloadPath(options.runtimeMainDirectory),
@@ -41,6 +52,11 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
       webSecurity: true,
     },
   });
+  const previewOwnerId = win.webContents.id;
+  const rendererUrl = resolveRendererEntry(options.isDev, options.runtimeMainDirectory);
+  const crashRecovery = new RendererCrashRecovery();
+  let rendererReloadTimer: ReturnType<typeof setTimeout> | undefined;
+  let showingCrashPage = false;
 
   trackWindowState(win);
   if (shouldMaximize(ui) && !win.isDestroyed()) win.maximize();
@@ -54,8 +70,7 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
       }
     }
   };
-  win.once("ready-to-show", showWin);
-  setTimeout(showWin, 3_000);
+  installWindowShowFallback(win, showWin);
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url) || /^mailto:/i.test(url)) void shell.openExternal(url);
@@ -63,9 +78,16 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
   });
 
   win.webContents.on("will-navigate", (event, url) => {
-    const allowed =
-      url.startsWith("app://") || url.startsWith("http://localhost:5173") || url.startsWith("http://127.0.0.1:5173");
-    if (!allowed) {
+    if (url === RENDERER_CRASH_RETRY_URL) {
+      event.preventDefault();
+      crashRecovery.reset();
+      showingCrashPage = false;
+      if (rendererReloadTimer) clearTimeout(rendererReloadTimer);
+      rendererReloadTimer = undefined;
+      if (!win.isDestroyed()) void win.loadURL(rendererUrl);
+      return;
+    }
+    if (!isAllowedMainNavigation(url, options.isDev)) {
       event.preventDefault();
       if (/^https?:/i.test(url)) void shell.openExternal(url);
     }
@@ -78,12 +100,33 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
     }
   });
 
-  win.on("closed", () => options.onClosed?.(win));
+  win.on("closed", () => {
+    if (rendererReloadTimer) clearTimeout(rendererReloadTimer);
+    rendererReloadTimer = undefined;
+    releaseHtmlPreviewsForOwner(previewOwnerId);
+    options.onClosed?.(win);
+  });
 
   win.webContents.on("render-process-gone", (_event, details) => {
+    releaseHtmlPreviewsForOwner(previewOwnerId);
     options.onRendererUnavailable?.(`render-process-gone:${details.reason}`);
     appendMainLog(`render-process-gone: ${details.reason}`);
-    if (!win.isDestroyed()) win.reload();
+    if (win.isDestroyed() || showingCrashPage) return;
+    const action = crashRecovery.record(details.reason);
+    if (action.kind === "ignore") return;
+    if (action.kind === "halt") {
+      showingCrashPage = true;
+      const page = createRendererCrashPage(action.reason, currentTheme());
+      void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(page)}`);
+      return;
+    }
+    appendMainLog(`renderer reload attempt=${action.attempt} delayMs=${action.delayMs}`);
+    if (rendererReloadTimer) clearTimeout(rendererReloadTimer);
+    rendererReloadTimer = setTimeout(() => {
+      rendererReloadTimer = undefined;
+      if (!win.isDestroyed()) void win.loadURL(rendererUrl);
+    }, action.delayMs);
+    rendererReloadTimer.unref?.();
   });
 
   // Main-owned child Views outlive the page Renderer. Hide them before the
@@ -91,6 +134,10 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
   // surface above the replacement React UI.
   win.webContents.on("did-start-loading", () => {
     options.onRendererUnavailable?.("did-start-loading");
+  });
+
+  win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) releaseHtmlPreviewsForOwner(previewOwnerId);
   });
 
   win.webContents.on("did-finish-load", () => {
@@ -101,12 +148,7 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
   win.webContents.on("did-fail-load", (_event, code, description, validatedURL, isMainFrame) => {
     if (!isMainFrame || code === -3) return;
     appendMainLog(`did-fail-load code=${code} desc=${description} url=${validatedURL}`);
-    const help =
-      `<!DOCTYPE html><html><body style="font-family:system-ui;background:#f7f6f3;padding:40px;color:#1c1a17">` +
-      `<h1 style="font-family:ui-monospace,monospace;font-size:18px">Cannot load UI</h1>` +
-      `<p style="color:#57534a;font-size:13.5px;line-height:1.55">Failed to load <code>${validatedURL}</code><br/>Error ${code}: ${description}</p>` +
-      `<p style="color:#57534a;font-size:13.5px">Try: <code>npm run build && npm start</code> or <code>npm run dev</code></p>` +
-      `</body></html>`;
+    const help = createLoadFailurePage(code, description, validatedURL, currentTheme());
     void win.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(help)}`);
   });
 
@@ -118,9 +160,8 @@ export function createMainWindow(options: CreateMainWindowOptions): BrowserWindo
     if (level >= 2) options.onConsoleError?.(message);
   });
 
-  const url = resolveRendererEntry(options.isDev, options.runtimeMainDirectory);
-  appendMainLog(`loadURL ${url}`);
-  void win.loadURL(url);
+  appendMainLog(`loadURL ${rendererUrl}`);
+  void win.loadURL(rendererUrl);
 
   return win;
 }

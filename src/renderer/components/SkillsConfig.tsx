@@ -1,8 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { forwardRef, useState, useEffect, useCallback, useImperativeHandle, useRef } from "react";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/i18n";
 import type { SkillSearchResult } from "@/lib/api-types";
+import { LatestAbortableRequest } from "@/lib/latest-abortable-request";
 import { CapabilityRequired, parseCapabilityIssue, type CapabilityIssue } from "@/components/CapabilityRequired";
+import { formatCompactNumber } from "@/lib/locale-format";
+
+type Translate = (key: string, fallback: string) => string;
 
 interface Skill {
   name: string;
@@ -29,6 +33,12 @@ function sourceLabel(skill: Skill): string {
   return "path";
 }
 
+function sourceLabelText(label: string, t: Translate): string {
+  if (label === "global") return t("skillScopeGlobal", "global");
+  if (label === "project") return t("skillScopeProject", "project");
+  return t("skillScopePath", "path");
+}
+
 function Toggle({ enabled, loading, onToggle }: { enabled: boolean; loading: boolean; onToggle: () => void }) {
   const { t } = useI18n();
   return (
@@ -38,15 +48,15 @@ function Toggle({ enabled, loading, onToggle }: { enabled: boolean; loading: boo
       aria-checked={enabled}
       aria-label={
         enabled
-          ? t("skillToggleDisable", "Disable skill in model prompt")
-          : t("skillToggleEnable", "Enable skill in model prompt")
+          ? t("disableSkillInModelPrompt", "Disable skill in model prompt")
+          : t("enableSkillInModelPrompt", "Enable skill in model prompt")
       }
       onClick={onToggle}
       disabled={loading}
       title={
         enabled
-          ? t("skillToggleDisableTitle", "Visible in model prompt — click to disable")
-          : t("skillToggleEnableTitle", "Hidden from model prompt — click to enable")
+          ? t("visibleSkillInModelPrompt", "Visible in model prompt — click to disable")
+          : t("hiddenSkillFromModelPrompt", "Hidden from model prompt — click to enable")
       }
       style={{
         flexShrink: 0,
@@ -79,21 +89,23 @@ function Toggle({ enabled, loading, onToggle }: { enabled: boolean; loading: boo
   );
 }
 
-function SkillDetail({
-  skill,
-  cwd,
-  onToggle,
-  toggling,
-  saveError,
-  onSaved,
-}: {
-  skill: Skill;
-  cwd: string;
-  onToggle: (skill: Skill) => void;
-  toggling: boolean;
-  saveError: string | null;
-  onSaved: () => void;
-}) {
+interface SkillDetailHandle {
+  hasUnsavedChanges: () => boolean;
+  save: () => Promise<boolean>;
+}
+
+const SkillDetail = forwardRef<
+  SkillDetailHandle,
+  {
+    skill: Skill;
+    cwd: string;
+    onToggle: (skill: Skill) => void;
+    toggling: boolean;
+    saveError: string | null;
+    onSaved: () => void;
+    onDirtyChange: (dirty: boolean) => void;
+  }
+>(function SkillDetail({ skill, cwd, onToggle, toggling, saveError, onSaved, onDirtyChange }, ref) {
   const { t } = useI18n();
   const label = sourceLabel(skill);
   const enabled = !skill.disableModelInvocation;
@@ -115,7 +127,8 @@ function SkillDetail({
         setSavedContent(result.content);
       })
       .catch((error) => {
-        if (!cancelled) setContentError(error instanceof Error ? error.message : String(error));
+        if (!cancelled)
+          setContentError(requestErrorMessage(error, t("skillFileLoadFailed", "Failed to load skill file.")));
       })
       .finally(() => {
         if (!cancelled) setContentLoading(false);
@@ -123,9 +136,10 @@ function SkillDetail({
     return () => {
       cancelled = true;
     };
-  }, [cwd, skill.filePath]);
+  }, [cwd, skill.filePath, t]);
 
-  const saveContent = useCallback(async () => {
+  const saveContent = useCallback(async (): Promise<boolean> => {
+    if (content === savedContent) return true;
     setContentSaving(true);
     setContentError(null);
     try {
@@ -135,15 +149,33 @@ function SkillDetail({
         body: JSON.stringify({ cwd, filePath: skill.filePath, content }),
       });
       const result = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok || result.error) throw new Error(result.error ?? `HTTP ${res.status}`);
+      if (!res.ok || result.error) {
+        throw new Error(result.error ?? t("httpErrorStatus", "HTTP {status}").replace("{status}", String(res.status)));
+      }
       setSavedContent(content);
       onSaved();
+      return true;
     } catch (error) {
-      setContentError(error instanceof Error ? error.message : String(error));
+      setContentError(requestErrorMessage(error, t("skillFileSaveFailed", "Failed to save skill file.")));
+      return false;
     } finally {
       setContentSaving(false);
     }
-  }, [content, cwd, onSaved, skill.filePath]);
+  }, [content, cwd, onSaved, savedContent, skill.filePath, t]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      hasUnsavedChanges: () => content !== savedContent,
+      save: saveContent,
+    }),
+    [content, saveContent, savedContent],
+  );
+
+  useEffect(() => {
+    onDirtyChange(content !== savedContent);
+    return () => onDirtyChange(false);
+  }, [content, onDirtyChange, savedContent]);
 
   function displayPath(p: string): string {
     if (label === "project" && p.startsWith(cwd)) {
@@ -167,7 +199,7 @@ function SkillDetail({
             color: label === "project" ? "rgba(99,102,241,0.8)" : "var(--text-dim)",
           }}
         >
-          {label}
+          {sourceLabelText(label, t)}
         </span>
         <span
           style={{
@@ -187,7 +219,7 @@ function SkillDetail({
       </div>
 
       <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-        <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500 }}>{t("skillName", "Name")}</span>
+        <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500 }}>{t("name", "Name")}</span>
         <span
           style={{
             fontFamily: "var(--font-mono)",
@@ -201,7 +233,9 @@ function SkillDetail({
 
       <div style={{ display: "flex", flexDirection: "column", gap: 7, minHeight: 260 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500 }}>SKILL.md</span>
+          <span style={{ fontSize: 12, color: "var(--text-muted)", fontWeight: 500 }}>
+            {t("skillFileName", "SKILL.md")}
+          </span>
           <button
             type="button"
             onClick={() => void saveContent()}
@@ -228,8 +262,9 @@ function SkillDetail({
           <textarea
             value={content}
             onChange={(event) => setContent(event.target.value)}
+            disabled={contentSaving}
             spellCheck={false}
-            aria-label={t("skillContentLabel", "Skill markdown content")}
+            aria-label={t("skillMarkdownContent", "Skill markdown content")}
             style={{
               width: "100%",
               flex: 1,
@@ -258,10 +293,10 @@ function SkillDetail({
       </div>
     </div>
   );
-}
+});
 
 function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => void }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SkillSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -301,7 +336,7 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
         setResults(d.results ?? []);
         if ((d.results ?? []).length === 0) setSearchError(t("noSkillsFound", "No skills found"));
       } catch (e) {
-        setSearchError(String(e));
+        setSearchError(requestErrorMessage(e, t("skillSearchFailed", "Skill search failed.")));
       } finally {
         setSearching(false);
       }
@@ -335,11 +370,8 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
             setInstallError(
               safeInstallError(
                 d.error,
-                `HTTP ${res.status}`,
-                t(
-                  "skillToolUnavailable",
-                  "A required developer tool is unavailable. Rescan tools or install JavaScript Essentials.",
-                ),
+                t("httpErrorStatus", "HTTP {status}").replace("{status}", String(res.status)),
+                t,
               ),
             );
           }
@@ -352,11 +384,8 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
         setInstallError(
           safeInstallError(
             e instanceof Error ? e.message : String(e),
-            t("skillInstallFailed", "Skill installation failed."),
-            t(
-              "skillToolUnavailable",
-              "A required developer tool is unavailable. Rescan tools or install JavaScript Essentials.",
-            ),
+            t("skillInstallationFailed", "Skill installation failed."),
+            t,
           ),
         );
       } finally {
@@ -379,7 +408,7 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
           marginBottom: 20,
         }}
       >
-        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{t("addSkillTitle", "Add Skill")}</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{t("addSkill", "Add skill")}</div>
 
         {/* Search row */}
         <div style={{ display: "flex", gap: 8 }}>
@@ -391,8 +420,8 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
             onKeyDown={(e) => {
               if (e.key === "Enter") void search(query);
             }}
-            placeholder={t("skillSearchPlaceholder", "e.g. react, testing, deploy")}
-            aria-label={t("searchSkillsLabel", "Search skills")}
+            placeholder={t("skillSearchExample", "e.g. react, testing, deploy")}
+            aria-label={t("searchSkills", "Search skills")}
             style={{
               flex: 1,
               minHeight: 36,
@@ -452,7 +481,7 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
                   borderRight: s === "global" ? "1px solid var(--border)" : "none",
                 }}
               >
-                {s}
+                {sourceLabelText(s, t)}
               </button>
             ))}
           </div>
@@ -537,15 +566,20 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
                     >
                       {repopart}
                     </span>
-                    <span
-                      style={{
-                        fontSize: 12,
-                        color: "var(--text-muted)",
-                        fontWeight: 500,
-                      }}
-                    >
-                      {r.installs}
-                    </span>
+                    {r.installs > 0 && (
+                      <span
+                        style={{
+                          fontSize: 12,
+                          color: "var(--text-muted)",
+                          fontWeight: 500,
+                        }}
+                      >
+                        {t("skillInstallCount", "{count} installs").replace(
+                          "{count}",
+                          formatCompactNumber(r.installs, language),
+                        )}
+                      </span>
+                    )}
                     {r.url && (
                       <a
                         href={r.url}
@@ -557,7 +591,7 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
                           textDecoration: "none",
                         }}
                       >
-                        skills.sh ↗
+                        {t("skillsCatalogLink", "skills.sh ↗")}
                       </a>
                     )}
                   </div>
@@ -579,7 +613,7 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
                   }}
                 >
                   {isInstalled
-                    ? t("installed", "✓ Installed")
+                    ? t("skillInstalled", "✓ Installed")
                     : isInstalling
                       ? t("installing", "Installing…")
                       : t("install", "Install")}
@@ -592,16 +626,16 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
         !searchError &&
         !searching && (
           <div style={{ fontSize: 13, color: "var(--text-dim)", lineHeight: 1.8 }}>
-            {t("skillDiscoverSearch", "Search")}{" "}
+            {t("searchSkillsCatalogPrefix", "Search")}{" "}
             <a
               href="https://skills.sh"
               target="_blank"
               rel="noreferrer"
               style={{ color: "var(--accent)", textDecoration: "none" }}
             >
-              skills.sh
+              {t("skillsCatalogName", "skills.sh")}
             </a>{" "}
-            {t("skillDiscoverSuffix", "to discover and install skills for your agent.")}
+            {t("searchSkillsCatalogSuffix", "to discover and install skills for your agent.")}
           </div>
         )
       )}
@@ -609,23 +643,36 @@ function AddSkillPanel({ cwd, onInstalled }: { cwd: string; onInstalled: () => v
   );
 }
 
-function safeInstallError(message: string | undefined, fallback: string, toolUnavailable: string): string {
+function safeInstallError(message: string | undefined, fallback: string, t: Translate): string {
   if (!message) return fallback;
   if (/ENOENT|spawn\s+(?:npm|npx|node)|not found/i.test(message)) {
-    return toolUnavailable;
+    return t(
+      "skillDeveloperToolUnavailable",
+      "A required developer tool is unavailable. Rescan tools or install JavaScript Essentials.",
+    );
   }
+  if (/failed to fetch|network\s*error|load failed/i.test(message)) return fallback;
   return message;
 }
 
-export function SkillsConfig({
-  cwd,
-  onClose,
-  embedded = false,
-}: {
-  cwd: string;
-  onClose: () => void;
-  embedded?: boolean;
-}) {
+function requestErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof TypeError) return fallback;
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+export interface SkillsConfigHandle {
+  requestLeave: (onAllowed: () => void) => void;
+}
+
+export const SkillsConfig = forwardRef<
+  SkillsConfigHandle,
+  {
+    cwd: string;
+    onClose: () => void;
+    embedded?: boolean;
+  }
+>(function SkillsConfig({ cwd, onClose, embedded = false }, ref) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -635,28 +682,87 @@ export function SkillsConfig({
   const [toggling, setToggling] = useState<Set<string>>(new Set());
   const [saveError, setSaveError] = useState<string | null>(null);
   const [addMode, setAddMode] = useState(false);
+  const [detailDirty, setDetailDirty] = useState(false);
+  const [pendingTransition, setPendingTransition] = useState<(() => void) | null>(null);
+  const [transitionSaving, setTransitionSaving] = useState(false);
+  const skillsRequestRef = useRef(new LatestAbortableRequest());
+  const detailRef = useRef<SkillDetailHandle>(null);
 
-  const loadSkills = useCallback(() => {
-    setLoading(true);
-    setError(null);
-    fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`)
-      .then((r) => r.json())
-      .then((d: { skills?: Skill[]; error?: string }) => {
-        if (d.error) {
-          setError(d.error);
-          return;
-        }
-        const list = d.skills ?? [];
-        setSkills(list);
-        if (list.length > 0 && !selected) setSelected(list[0].filePath);
-      })
-      .catch((e) => setError(String(e)))
-      .finally(() => setLoading(false));
-  }, [cwd, selected]);
+  const requestTransition = useCallback(
+    (action: () => void) => {
+      if (!(detailRef.current?.hasUnsavedChanges() ?? detailDirty)) {
+        action();
+        return;
+      }
+      setPendingTransition(() => action);
+    },
+    [detailDirty],
+  );
+
+  useImperativeHandle(ref, () => ({ requestLeave: requestTransition }), [requestTransition]);
 
   useEffect(() => {
-    loadSkills();
-  }, [cwd]); // eslint-disable-line react-hooks/exhaustive-deps -- only project changes should reload skills.
+    if (!detailDirty) return;
+    const preventReload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", preventReload);
+    return () => window.removeEventListener("beforeunload", preventReload);
+  }, [detailDirty]);
+
+  const discardAndContinue = useCallback(() => {
+    const action = pendingTransition;
+    setPendingTransition(null);
+    setDetailDirty(false);
+    action?.();
+  }, [pendingTransition]);
+
+  const saveAndContinue = useCallback(async () => {
+    setTransitionSaving(true);
+    const saved = (await detailRef.current?.save()) ?? false;
+    setTransitionSaving(false);
+    if (!saved) return;
+    const action = pendingTransition;
+    setPendingTransition(null);
+    action?.();
+  }, [pendingTransition]);
+
+  const loadSkills = useCallback(async () => {
+    const request = skillsRequestRef.current.begin();
+    setLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(`/api/skills?cwd=${encodeURIComponent(cwd)}`, { signal: request.signal });
+      const result = (await response.json()) as { skills?: Skill[]; error?: string };
+      if (!skillsRequestRef.current.isCurrent(request.generation)) return;
+      if (!response.ok || result.error) {
+        throw new Error(
+          result.error ?? t("httpErrorStatus", "HTTP {status}").replace("{status}", String(response.status)),
+        );
+      }
+      const list = result.skills ?? [];
+      setSkills(list);
+      setSelected((current) =>
+        current && list.some((skill) => skill.filePath === current) ? current : (list[0]?.filePath ?? null),
+      );
+    } catch (loadError) {
+      if (request.signal.aborted || !skillsRequestRef.current.isCurrent(request.generation)) return;
+      setError(requestErrorMessage(loadError, t("skillsLoadFailed", "Failed to load skills.")));
+    } finally {
+      if (skillsRequestRef.current.finish(request.generation)) setLoading(false);
+    }
+  }, [cwd, t]);
+
+  useEffect(() => {
+    const requests = skillsRequestRef.current;
+    setSkills([]);
+    setSelected(null);
+    void loadSkills();
+    return () => {
+      requests.cancel();
+    };
+  }, [loadSkills]);
 
   const toggle = useCallback(
     async (skill: Skill) => {
@@ -675,14 +781,14 @@ export function SkillsConfig({
         });
         const d = (await res.json()) as { success?: boolean; error?: string };
         if (!res.ok || d.error) {
-          setSaveError(d.error ?? `HTTP ${res.status}`);
+          setSaveError(d.error ?? t("httpErrorStatus", "HTTP {status}").replace("{status}", String(res.status)));
           return;
         }
         setSkills((prev) =>
           prev.map((s) => (s.filePath === skill.filePath ? { ...s, disableModelInvocation: next } : s)),
         );
       } catch (e) {
-        setSaveError(String(e));
+        setSaveError(requestErrorMessage(e, t("skillVisibilitySaveFailed", "Failed to update skill visibility.")));
       } finally {
         setToggling((s) => {
           const n = new Set(s);
@@ -691,7 +797,7 @@ export function SkillsConfig({
         });
       }
     },
-    [cwd],
+    [cwd, t],
   );
 
   const selectedSkill = skills.find((s) => s.filePath === selected) ?? null;
@@ -718,7 +824,7 @@ export function SkillsConfig({
             }
       }
       onClick={(e) => {
-        if (!embedded && e.target === e.currentTarget) onClose();
+        if (!embedded && e.target === e.currentTarget) requestTransition(onClose);
       }}
     >
       <div
@@ -765,7 +871,7 @@ export function SkillsConfig({
               </code>
             </div>
             <button
-              onClick={onClose}
+              onClick={() => requestTransition(onClose)}
               style={{
                 background: "none",
                 border: "none",
@@ -829,15 +935,10 @@ export function SkillsConfig({
                 </div>
               ) : (
                 (() => {
-                  const scopeLabels: Record<string, string> = {
-                    project: t("scopeProject", "project"),
-                    global: t("scopeGlobal", "global"),
-                    path: t("scopePath", "path"),
-                  };
                   const groups: { label: string; skills: typeof skills }[] = [];
                   for (const grpLabel of ["project", "global", "path"]) {
                     const grpSkills = skills.filter((s) => sourceLabel(s) === grpLabel);
-                    if (grpSkills.length > 0) groups.push({ label: scopeLabels[grpLabel], skills: grpSkills });
+                    if (grpSkills.length > 0) groups.push({ label: grpLabel, skills: grpSkills });
                   }
                   return groups.map(({ label: grpLabel, skills: grpSkills }) => (
                     <div key={grpLabel} style={{ marginBottom: 6 }}>
@@ -851,7 +952,7 @@ export function SkillsConfig({
                           letterSpacing: "0.06em",
                         }}
                       >
-                        {grpLabel}
+                        {sourceLabelText(grpLabel, t)}
                       </div>
                       {grpSkills.map((skill) => {
                         const isSelected = !addMode && selected === skill.filePath;
@@ -860,8 +961,11 @@ export function SkillsConfig({
                           <div
                             key={skill.filePath}
                             onClick={() => {
-                              setSelected(skill.filePath);
-                              setAddMode(false);
+                              if (isSelected) return;
+                              requestTransition(() => {
+                                setSelected(skill.filePath);
+                                setAddMode(false);
+                              });
                             }}
                             style={{
                               display: "flex",
@@ -921,7 +1025,7 @@ export function SkillsConfig({
               }}
             >
               <div
-                onClick={() => setAddMode(true)}
+                onClick={() => requestTransition(() => setAddMode(true))}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -964,18 +1068,20 @@ export function SkillsConfig({
               <AddSkillPanel
                 cwd={cwd}
                 onInstalled={() => {
-                  loadSkills();
+                  void loadSkills();
                 }}
               />
             ) : loading ? null : selectedSkill ? (
               <SkillDetail
+                ref={detailRef}
                 key={selectedSkill.filePath}
                 skill={selectedSkill}
                 cwd={cwd}
                 onToggle={toggle}
                 toggling={toggling.has(selectedSkill.filePath)}
                 saveError={saveError}
-                onSaved={loadSkills}
+                onSaved={() => void loadSkills()}
+                onDirtyChange={setDetailDirty}
               />
             ) : (
               <div
@@ -1007,7 +1113,7 @@ export function SkillsConfig({
             }}
           >
             <button
-              onClick={onClose}
+              onClick={() => requestTransition(onClose)}
               style={{
                 padding: "6px 14px",
                 background: "none",
@@ -1023,6 +1129,94 @@ export function SkillsConfig({
           </div>
         )}
       </div>
+      {pendingTransition && (
+        <div
+          role="presentation"
+          style={{
+            position: "absolute",
+            inset: 0,
+            zIndex: 2,
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+            background: "rgba(0,0,0,0.35)",
+          }}
+          onClick={(event) => {
+            if (event.target === event.currentTarget && !transitionSaving) setPendingTransition(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="unsaved-skill-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && !transitionSaving) {
+                event.preventDefault();
+                event.stopPropagation();
+                setPendingTransition(null);
+              }
+            }}
+            style={{
+              width: 420,
+              maxWidth: "100%",
+              padding: 18,
+              border: "1px solid var(--border)",
+              borderRadius: 9,
+              background: "var(--bg)",
+              boxShadow: "0 16px 48px rgba(0,0,0,0.3)",
+            }}
+          >
+            <h3 id="unsaved-skill-title" style={{ margin: 0, fontSize: 14, color: "var(--text)" }}>
+              {t("unsavedSkillChanges", "Unsaved skill changes")}
+            </h3>
+            <p style={{ margin: "8px 0 16px", fontSize: 12, lineHeight: 1.55, color: "var(--text-muted)" }}>
+              {t("unsavedSkillChangesDescription", "Save your SKILL.md changes before leaving this editor?")}
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button
+                type="button"
+                disabled={transitionSaving}
+                onClick={discardAndContinue}
+                style={leavePromptButtonStyle}
+              >
+                {t("discard", "Discard")}
+              </button>
+              <button
+                type="button"
+                disabled={transitionSaving}
+                onClick={() => setPendingTransition(null)}
+                style={leavePromptButtonStyle}
+              >
+                {t("cancel", "Cancel")}
+              </button>
+              <button
+                type="button"
+                disabled={transitionSaving}
+                onClick={() => void saveAndContinue()}
+                style={{
+                  ...leavePromptButtonStyle,
+                  borderColor: "var(--accent)",
+                  background: "var(--accent)",
+                  color: "#fff",
+                }}
+              >
+                {transitionSaving ? t("saving", "Saving…") : t("save", "Save")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
-}
+});
+
+const leavePromptButtonStyle: React.CSSProperties = {
+  minHeight: 34,
+  padding: "6px 12px",
+  border: "1px solid var(--border)",
+  borderRadius: 6,
+  background: "var(--bg-panel)",
+  color: "var(--text-muted)",
+  cursor: "pointer",
+  fontSize: 12,
+};

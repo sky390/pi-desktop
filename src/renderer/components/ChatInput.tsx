@@ -15,7 +15,8 @@ import type {
   QueuedMessages,
   SlashCommandInfo,
 } from "@/hooks/useAgentSession";
-import { clearDraft, getDraft, setDraft, type ChatDraftImage } from "@/lib/draft-store";
+import { DraftPersistenceController, getDraft, type ChatDraftImage } from "@/lib/draft-store";
+import { LatestAbortableRequest } from "@/lib/latest-abortable-request";
 import {
   buildEntriesFromFiles,
   buildAtInsertText,
@@ -28,6 +29,13 @@ import { FolderIcon, getFileIcon } from "./FileIcons";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import { useI18n } from "@/i18n";
 import type { ModelCatalogStatus } from "@contract/types";
+import { processImageFileBatch } from "@/lib/image-file-processing";
+import {
+  captureComposerSubmission,
+  failedComposerSubmissionAction,
+  mergeFailedSubmissionImages,
+  type ComposerSubmissionSnapshot,
+} from "@/lib/composer-submission";
 
 export interface AttachedImage {
   data: string; // base64, no prefix
@@ -44,9 +52,13 @@ interface ModelOption {
 interface Props {
   onSend: (message: string, images?: AttachedImage[]) => void;
   onAbort: () => void;
-  onSteer?: (message: string, images?: AttachedImage[]) => void;
-  onFollowUp?: (message: string, images?: AttachedImage[]) => void;
-  onPromptWithStreamingBehavior?: (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => void;
+  onSteer?: (message: string, images?: AttachedImage[]) => Promise<void> | void;
+  onFollowUp?: (message: string, images?: AttachedImage[]) => Promise<void> | void;
+  onPromptWithStreamingBehavior?: (
+    message: string,
+    behavior: "steer" | "followUp",
+    images?: AttachedImage[],
+  ) => Promise<void> | void;
   isStreaming: boolean;
   model?: { provider: string; modelId: string } | null;
   isAutoModelSelection?: boolean;
@@ -256,12 +268,12 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
 ) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
-  const [value, setValue] = useState(() => (draftKey ? (getDraft(draftKey)?.value ?? "") : ""));
+  const [value, setValueState] = useState(() => (draftKey ? (getDraft(draftKey)?.value ?? "") : ""));
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [modelDropdownRect, setModelDropdownRect] = useState<{ top: number; left: number; width: number } | null>(null);
   const [toolDropdownOpen, setToolDropdownOpen] = useState(false);
   const [thinkingDropdownOpen, setThinkingDropdownOpen] = useState(false);
-  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>(() =>
+  const [attachedImages, setAttachedImagesState] = useState<AttachedImage[]>(() =>
     draftKey ? (getDraft(draftKey)?.images.map(draftImageToAttachedImage) ?? []) : [],
   );
   const [slashMenuOpen, setSlashMenuOpen] = useState(false);
@@ -278,6 +290,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     query: string;
     matches: FileIndexEntry[];
   } | null>(null);
+  const [imageAttachNotice, setImageAttachNotice] = useState<string | null>(null);
+  const [submissionNotice, setSubmissionNotice] = useState<string | null>(null);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
@@ -295,10 +309,29 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   const slashItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const atItemRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fileIndexMetaRef = useRef<{ cwd: string; fetchedAt: number } | null>(null);
-  const fileIndexFetchingRef = useRef<string | null>(null);
+  const fileIndexRequestRef = useRef(new LatestAbortableRequest());
+  const fileSearchRequestRef = useRef(new LatestAbortableRequest());
   const draftKeyRef = useRef(draftKey);
   const valueRef = useRef(value);
   const attachedImagesRef = useRef(attachedImages);
+  const imageBatchGenerationRef = useRef(0);
+  const imageProcessingActiveRef = useRef(true);
+  const pendingImagePreviewsRef = useRef(new Set<string>());
+  const inputRevisionRef = useRef(0);
+  const draftPersistenceRef = useRef<DraftPersistenceController | null>(null);
+  if (!draftPersistenceRef.current) draftPersistenceRef.current = new DraftPersistenceController();
+  const setValue = useCallback((next: React.SetStateAction<string>) => {
+    const resolved = typeof next === "function" ? next(valueRef.current) : next;
+    inputRevisionRef.current += 1;
+    valueRef.current = resolved;
+    setValueState(resolved);
+  }, []);
+  const setAttachedImages = useCallback((next: React.SetStateAction<AttachedImage[]>) => {
+    const resolved = typeof next === "function" ? next(attachedImagesRef.current) : next;
+    inputRevisionRef.current += 1;
+    attachedImagesRef.current = resolved;
+    setAttachedImagesState(resolved);
+  }, []);
   valueRef.current = value;
   attachedImagesRef.current = attachedImages;
 
@@ -366,57 +399,95 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
       if (isStreaming) return;
       const imageFiles = files.filter((f) => f.type.startsWith("image/"));
       if (!imageFiles.length) return;
-      const newImages = await Promise.all(
-        imageFiles.map(
-          (file) =>
-            new Promise<AttachedImage>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => {
-                const result = reader.result as string;
-                // result is "data:<mime>;base64,<data>"
-                const base64 = result.split(",")[1];
-                resolve({ data: base64, mimeType: file.type, previewUrl: URL.createObjectURL(file) });
-              };
-              reader.onerror = reject;
-              reader.readAsDataURL(file);
-            }),
-        ),
-      );
-      setAttachedImages((prev) => [...prev, ...newImages]);
+      const generation = ++imageBatchGenerationRef.current;
+      const { images, failures } = await processImageFileBatch(imageFiles);
+      if (!imageProcessingActiveRef.current) {
+        images.forEach(revokeImagePreview);
+        return;
+      }
+      if (images.length > 0) {
+        images.forEach((image) => pendingImagePreviewsRef.current.add(image.previewUrl));
+        setAttachedImages((prev) => [...prev, ...images]);
+      }
+      if (generation === imageBatchGenerationRef.current) {
+        setImageAttachNotice(
+          failures.length === 0
+            ? null
+            : images.length > 0
+              ? `${failures.length} of ${imageFiles.length} images could not be attached.`
+              : "The selected images could not be attached.",
+        );
+      }
     },
-    [isStreaming],
+    [isStreaming, setAttachedImages],
   );
 
-  const removeImage = useCallback((index: number) => {
-    setAttachedImages((prev) => {
-      const next = [...prev];
-      const [removed] = next.splice(index, 1);
-      if (removed) revokeImagePreview(removed);
-      return next;
-    });
-  }, []);
+  const removeImage = useCallback(
+    (index: number) => {
+      setAttachedImages((prev) => {
+        const next = [...prev];
+        const [removed] = next.splice(index, 1);
+        if (removed) revokeImagePreview(removed);
+        return next;
+      });
+    },
+    [setAttachedImages],
+  );
 
   const clearImages = useCallback(() => {
     setAttachedImages((prev) => {
       prev.forEach(revokeImagePreview);
       return [];
     });
-  }, []);
+  }, [setAttachedImages]);
 
   const clearInput = useCallback(() => {
     setValue("");
     setAtQuery(null);
-    if (draftKey) clearDraft(draftKey);
-    if (draftKeyRef.current && draftKeyRef.current !== draftKey) clearDraft(draftKeyRef.current);
+    if (draftKey) draftPersistenceRef.current?.clear(draftKey);
+    if (draftKeyRef.current && draftKeyRef.current !== draftKey) {
+      draftPersistenceRef.current?.clear(draftKeyRef.current);
+    }
     clearImages();
     if (textareaRef.current) {
       textareaRef.current.style.height = "auto";
     }
-  }, [clearImages, draftKey]);
+  }, [clearImages, draftKey, setValue]);
+
+  const restoreFailedSubmission = useCallback(
+    (snapshot: ComposerSubmissionSnapshot, clearedAtRevision: number, kind: "send" | "queue") => {
+      const action = failedComposerSubmissionAction(clearedAtRevision, inputRevisionRef.current);
+      if (action === "restore") {
+        setValue(snapshot.value);
+        setAttachedImages(snapshot.images);
+      } else if (snapshot.images.length > 0) {
+        setAttachedImages((current) => mergeFailedSubmissionImages(current, snapshot.images));
+      }
+      setSubmissionNotice(
+        action === "restore"
+          ? kind === "send"
+            ? "Message was not sent. Your draft was restored."
+            : "Message could not be queued. Your draft was restored."
+          : kind === "send"
+            ? "The previous message was not sent. Your newer draft was kept."
+            : "The previous message could not be queued. Your newer draft was kept.",
+      );
+    },
+    [setAttachedImages, setValue],
+  );
+
+  const commitCurrentDraft = useCallback(() => {
+    const currentDraftKey = draftKeyRef.current;
+    if (!currentDraftKey) return;
+    draftPersistenceRef.current?.commit(currentDraftKey, {
+      value: valueRef.current,
+      images: attachedImagesRef.current.map(imageToDraftImage),
+    });
+  }, []);
 
   useEffect(() => {
     if (!draftKey || draftKeyRef.current !== draftKey) return;
-    setDraft(draftKey, {
+    draftPersistenceRef.current?.schedule(draftKey, {
       value,
       images: attachedImages.map(imageToDraftImage),
     });
@@ -427,7 +498,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     if (previousDraftKey === draftKey) return;
 
     if (previousDraftKey) {
-      setDraft(previousDraftKey, {
+      draftPersistenceRef.current?.commit(previousDraftKey, {
         value: valueRef.current,
         images: attachedImagesRef.current.map(imageToDraftImage),
       });
@@ -441,7 +512,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
       prev.forEach(revokeImagePreview);
       return draft?.images.map(draftImageToAttachedImage) ?? [];
     });
-  }, [draftKey]);
+  }, [draftKey, setAttachedImages, setValue]);
 
   useEffect(() => {
     const ta = textareaRef.current;
@@ -451,43 +522,61 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
   }, [value]);
 
   useEffect(() => {
+    for (const image of attachedImages) pendingImagePreviewsRef.current.delete(image.previewUrl);
+  }, [attachedImages]);
+
+  useEffect(() => {
+    const pendingPreviews = pendingImagePreviewsRef.current;
+    imageProcessingActiveRef.current = true;
     return () => {
+      imageProcessingActiveRef.current = false;
+      commitCurrentDraft();
+      draftPersistenceRef.current?.dispose();
+      for (const previewUrl of pendingPreviews) URL.revokeObjectURL(previewUrl);
+      pendingPreviews.clear();
       attachedImagesRef.current.forEach(revokeImagePreview);
     };
-  }, []);
+  }, [commitCurrentDraft]);
 
   const handleSend = useCallback(async () => {
     const msg = value.trim();
     if (!msg && !attachedImages.length) return;
     if (isStreaming) return;
     onAudioUnlock?.();
-    // ISSUE-006: snapshot draft before clear; restore on failure
-    const snapshot = {
-      value,
-      images: attachedImages.map((img) => ({ ...img })),
-    };
-    if (!attachedImages.length && msg.startsWith("/") && onBuiltinCommand) {
-      const result = await onBuiltinCommand(msg);
-      if (result.handled) {
-        if (!result.error) clearInput();
-        return;
-      }
-    }
+    const snapshot = captureComposerSubmission(value, attachedImages);
+    setSubmissionNotice(null);
+    commitCurrentDraft();
+    clearInput();
+    const clearedAtRevision = inputRevisionRef.current;
     try {
+      if (!attachedImages.length && msg.startsWith("/") && onBuiltinCommand) {
+        const result = await onBuiltinCommand(msg);
+        if (result.handled) {
+          if (result.error) restoreFailedSubmission(snapshot, clearedAtRevision, "send");
+          return;
+        }
+      }
       const result = onSend(msg, attachedImages.length ? attachedImages : undefined) as
         void | Promise<unknown> | { ok?: boolean };
-      const settled = result instanceof Promise ? await result : result;
+      const settled = await Promise.resolve(result);
       if (settled && typeof settled === "object" && "ok" in settled && settled.ok === false) {
-        setValue(snapshot.value);
-        setAttachedImages(snapshot.images);
+        restoreFailedSubmission(snapshot, clearedAtRevision, "send");
         return;
       }
-      clearInput();
     } catch {
-      setValue(snapshot.value);
-      setAttachedImages(snapshot.images);
+      restoreFailedSubmission(snapshot, clearedAtRevision, "send");
     }
-  }, [value, attachedImages, isStreaming, onBuiltinCommand, onSend, clearInput, onAudioUnlock]);
+  }, [
+    attachedImages,
+    clearInput,
+    commitCurrentDraft,
+    isStreaming,
+    onAudioUnlock,
+    onBuiltinCommand,
+    onSend,
+    restoreFailedSubmission,
+    value,
+  ]);
 
   const slashQuery = value.startsWith("/") && !/\s/.test(value.slice(1)) ? value.slice(1).toLowerCase() : null;
 
@@ -566,18 +655,31 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     if (!needsServerSearch || !cwd || !atQueryText) return;
     const fetchCwd = cwd;
     const query = atQueryText;
+    const fileSearchRequests = fileSearchRequestRef.current;
+    let generation: number | null = null;
     const timer = setTimeout(() => {
-      fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`)
+      const request = fileSearchRequests.begin();
+      generation = request.generation;
+      fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}&q=${encodeURIComponent(query)}`, {
+        signal: request.signal,
+      })
         .then((res) => {
           if (!res.ok) throw new Error(`file search failed: ${res.status}`);
           return res.json() as Promise<{ matches?: FileIndexEntry[] }>;
         })
-        .then((data) => setAtServerResult({ cwd: fetchCwd, query, matches: data.matches ?? [] }))
+        .then((data) => {
+          if (!fileSearchRequests.isCurrent(request.generation)) return;
+          setAtServerResult({ cwd: fetchCwd, query, matches: data.matches ?? [] });
+        })
         .catch(() => {
           // Keep showing local matches; the next keystroke retries.
-        });
+        })
+        .finally(() => fileSearchRequests.finish(request.generation));
     }, 150);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      if (generation !== null) fileSearchRequests.cancel(generation);
+    };
   }, [needsServerSearch, atQueryText, cwd]);
 
   const serverResultInUse =
@@ -604,27 +706,31 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     if (!atTokenActive || !cwd) return;
     const meta = fileIndexMetaRef.current;
     if (meta && meta.cwd === cwd && Date.now() - meta.fetchedAt < 10_000) return;
-    if (fileIndexFetchingRef.current === cwd) return;
-    fileIndexFetchingRef.current = cwd;
     const fetchCwd = cwd;
+    const fileIndexRequests = fileIndexRequestRef.current;
+    const { generation, signal } = fileIndexRequests.begin();
     setFileIndexLoading(true);
-    fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`)
+    fetch(`/api/file-index?cwd=${encodeURIComponent(fetchCwd)}`, { signal })
       .then((res) => {
         if (!res.ok) throw new Error(`file index failed: ${res.status}`);
         return res.json() as Promise<{ files?: string[]; truncated?: boolean }>;
       })
       .then((data) => {
+        if (!fileIndexRequests.isCurrent(generation)) return;
         setFileIndex({ cwd: fetchCwd, entries: buildEntriesFromFiles(data.files ?? []), truncated: !!data.truncated });
         fileIndexMetaRef.current = { cwd: fetchCwd, fetchedAt: Date.now() };
       })
       .catch(() => {
+        if (!fileIndexRequests.isCurrent(generation)) return;
         // Leave any previous index in place; next open retries.
         fileIndexMetaRef.current = null;
       })
       .finally(() => {
-        fileIndexFetchingRef.current = null;
-        setFileIndexLoading(false);
+        if (fileIndexRequests.finish(generation)) setFileIndexLoading(false);
       });
+    return () => {
+      if (fileIndexRequests.cancel(generation)) setFileIndexLoading(false);
+    };
   }, [atTokenActive, cwd]);
 
   const applyAtCompletion = useCallback(
@@ -657,7 +763,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
         el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
       });
     },
-    [atQuery, value],
+    [atQuery, setValue, value],
   );
 
   useEffect(() => {
@@ -675,20 +781,23 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
     atItemRefs.current[atActiveIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [atActiveIndex, atMenuOpen]);
 
-  const applySlashCommand = useCallback((command: SlashCommandPaletteItem) => {
-    const nextValue = `/${command.name} `;
-    setValue(nextValue);
-    setSlashMenuOpen(false);
-    setSlashActiveIndex(0);
-    requestAnimationFrame(() => {
-      const ta = textareaRef.current;
-      if (!ta) return;
-      ta.focus();
-      ta.setSelectionRange(nextValue.length, nextValue.length);
-      ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-    });
-  }, []);
+  const applySlashCommand = useCallback(
+    (command: SlashCommandPaletteItem) => {
+      const nextValue = `/${command.name} `;
+      setValue(nextValue);
+      setSlashMenuOpen(false);
+      setSlashActiveIndex(0);
+      requestAnimationFrame(() => {
+        const ta = textareaRef.current;
+        if (!ta) return;
+        ta.focus();
+        ta.setSelectionRange(nextValue.length, nextValue.length);
+        ta.style.height = "auto";
+        ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+      });
+    },
+    [setValue],
+  );
 
   const sendQueued = useCallback(
     async (mode: "steer" | "followup") => {
@@ -696,12 +805,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
       if (!msg && !attachedImages.length) return;
       if (attachedImages.length) return;
       onAudioUnlock?.();
-      const snapshot = value;
+      const snapshot = captureComposerSubmission(value, attachedImages);
       const streamingBehavior = mode === "steer" ? "steer" : "followUp";
+      setSubmissionNotice(null);
+      commitCurrentDraft();
+      clearInput();
+      const clearedAtRevision = inputRevisionRef.current;
       try {
         if (msg.startsWith("/") && onPromptWithStreamingBehavior) {
           await Promise.resolve(onPromptWithStreamingBehavior(msg, streamingBehavior, undefined));
-          clearInput();
           return;
         }
         if (mode === "steer" && onSteer) {
@@ -709,12 +821,21 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
         } else if (mode === "followup" && onFollowUp) {
           await Promise.resolve(onFollowUp(msg, undefined));
         }
-        clearInput();
       } catch {
-        setValue(snapshot);
+        restoreFailedSubmission(snapshot, clearedAtRevision, "queue");
       }
     },
-    [value, attachedImages, onPromptWithStreamingBehavior, onSteer, onFollowUp, clearInput, onAudioUnlock],
+    [
+      attachedImages,
+      clearInput,
+      commitCurrentDraft,
+      onAudioUnlock,
+      onFollowUp,
+      onPromptWithStreamingBehavior,
+      onSteer,
+      restoreFailedSubmission,
+      value,
+    ],
   );
 
   const getNextSlashIndex = useCallback(
@@ -1219,6 +1340,77 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
             {retryInfo.errorMessage && <span style={{ opacity: 0.7, marginLeft: 4 }}>— {retryInfo.errorMessage}</span>}
           </div>
         )}
+        {imageAttachNotice && (
+          <div
+            role="alert"
+            style={{
+              marginBottom: 8,
+              padding: "5px 10px",
+              background: "color-mix(in srgb, var(--danger) 8%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--danger) 28%, var(--border))",
+              borderRadius: 6,
+              fontSize: 12,
+              color: "var(--danger)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+            }}
+          >
+            <span>{imageAttachNotice}</span>
+            <button
+              type="button"
+              onClick={() => setImageAttachNotice(null)}
+              aria-label="Dismiss image attachment error"
+              style={{
+                border: "none",
+                background: "transparent",
+                color: "inherit",
+                cursor: "pointer",
+                padding: 2,
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
+        {submissionNotice && (
+          <div
+            role="alert"
+            data-testid="composer-submission-error"
+            style={{
+              marginBottom: 8,
+              padding: "5px 10px",
+              background: "color-mix(in srgb, var(--danger) 8%, transparent)",
+              border: "1px solid color-mix(in srgb, var(--danger) 28%, var(--border))",
+              borderRadius: 6,
+              fontSize: 12,
+              color: "var(--danger)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 8,
+            }}
+          >
+            <span>{submissionNotice}</span>
+            <button
+              type="button"
+              onClick={() => setSubmissionNotice(null)}
+              aria-label="Dismiss submission error"
+              style={{
+                border: "none",
+                background: "transparent",
+                color: "inherit",
+                cursor: "pointer",
+                padding: 2,
+                lineHeight: 1,
+              }}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {compactResultText && (
           <div
             style={{
@@ -1711,7 +1903,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                   background: value.trim() || attachedImages.length ? "var(--accent)" : "var(--bg-hover)",
                   border: "none",
                   borderRadius: 9,
-                  color: value.trim() || attachedImages.length ? "#fff" : "var(--text-dim)",
+                  color: value.trim() || attachedImages.length ? "var(--on-accent)" : "var(--text-dim)",
                   cursor: value.trim() || attachedImages.length ? "pointer" : "not-allowed",
                   fontSize: 12.5,
                   fontWeight: 700,
@@ -1929,7 +2121,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                                 <div
                                   key={`${warning.provider}:${warning.code}`}
                                   role="alert"
-                                  style={{ marginTop: 6, color: "#d97706", fontSize: 11, whiteSpace: "normal" }}
+                                  style={{ marginTop: 6, color: "var(--warning)", fontSize: 11, whiteSpace: "normal" }}
                                 >
                                   {warning.message}
                                 </div>
@@ -1937,7 +2129,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                               {modelListError && (
                                 <div
                                   role="alert"
-                                  style={{ marginTop: 6, color: "#ef4444", fontSize: 11, whiteSpace: "normal" }}
+                                  style={{ marginTop: 6, color: "var(--danger)", fontSize: 11, whiteSpace: "normal" }}
                                 >
                                   {t("modelListLoadFailed", "Failed to refresh the model list")}
                                   {modelListError ? `: ${modelListError}` : ""}
@@ -2060,7 +2252,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                   background: "rgba(239,68,68,0.08)",
                   border: "1px solid rgba(239,68,68,0.3)",
                   borderRadius: 9,
-                  color: "#ef4444",
+                  color: "var(--danger)",
                   cursor: "pointer",
                   fontSize: 12,
                   fontWeight: 600,
@@ -2396,8 +2588,8 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                         position: "absolute",
                         bottom: "calc(100% + 6px)",
                         right: 0,
-                        background: "#1f2937",
-                        color: "#f87171",
+                        background: "var(--danger-soft)",
+                        color: "var(--danger)",
                         fontSize: 11,
                         padding: "4px 8px",
                         borderRadius: 5,
@@ -2429,7 +2621,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                       background: isCompacting ? "rgba(239,68,68,0.08)" : "var(--bg-panel)",
                       border: `1px solid ${isCompacting ? "rgba(239,68,68,0.3)" : "var(--border)"}`,
                       borderRadius: 9,
-                      color: isCompacting ? "#ef4444" : "var(--text-muted)",
+                      color: isCompacting ? "var(--danger)" : "var(--text-muted)",
                       cursor: isStreaming && !isCompacting ? "not-allowed" : "pointer",
                       fontSize: 12,
                       opacity: isStreaming && !isCompacting ? 0.5 : 1,
@@ -2438,11 +2630,11 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                     onMouseEnter={(e) => {
                       if (isStreaming && !isCompacting) return;
                       e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.16)" : "var(--bg-hover)";
-                      e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text)";
+                      e.currentTarget.style.color = isCompacting ? "var(--danger)" : "var(--text)";
                     }}
                     onMouseLeave={(e) => {
                       e.currentTarget.style.background = isCompacting ? "rgba(239,68,68,0.08)" : "var(--bg-panel)";
-                      e.currentTarget.style.color = isCompacting ? "#ef4444" : "var(--text-muted)";
+                      e.currentTarget.style.color = isCompacting ? "var(--danger)" : "var(--text-muted)";
                     }}
                     title={isCompacting ? t("stopCompaction", "Stop compaction") : t("compact", "Compact context")}
                     aria-label={isCompacting ? t("stopCompaction", "Stop compaction") : t("compact", "Compact context")}
@@ -2471,7 +2663,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput(
                           <line x1="10" y1="14" x2="3" y2="21" />
                           <line x1="21" y1="3" x2="14" y2="10" />
                         </svg>
-                        {!isMobile && <span style={{ whiteSpace: "nowrap" }}>{t("compact", "Compact")}</span>}
+                        {!isMobile && <span style={{ whiteSpace: "nowrap" }}>{t("compactAction", "Compact")}</span>}
                       </>
                     )}
                   </button>

@@ -42,6 +42,7 @@ import type {
 } from "../../contract/browser.ts";
 import { BrowserCdpCoordinator } from "./browser-cdp-coordinator.ts";
 import { BrowserConsoleBuffer } from "./browser-console-buffer.ts";
+import { isBrowserDevToolsShortcut } from "./browser-devtools-shortcut.ts";
 import { BrowserError } from "./browser-error.ts";
 import { BrowserIdentityManager } from "./browser-identity-manager.ts";
 import { BrowserInspectionStore } from "./browser-inspection-store.ts";
@@ -49,6 +50,12 @@ import { BrowserNetworkRecorder } from "./browser-network-recorder.ts";
 import { BrowserNetworkPolicy, createSessionNetworkPolicyOptions } from "./browser-network-policy.ts";
 import { redactBrowserText, redactBrowserUrl } from "./browser-redaction.ts";
 import type { BrowserProfileManager } from "./browser-profile-manager.ts";
+import {
+  MAX_REPLAY_RESPONSE_BYTES,
+  readBoundedResponseBody,
+  runBoundedNetworkAction,
+} from "./browser-response-body.ts";
+import { canResumeSensitiveAgentControl } from "./browser-sensitive-control.ts";
 
 const SNAPSHOT_WORLD_ID = 99_911;
 const MAX_SCREENSHOT_BYTES = 12 * 1024 * 1024;
@@ -91,6 +98,7 @@ type TabRecord = {
   queue: Promise<void>;
   activeAbort?: AbortController;
   pendingActions: Map<AbortController, { code: BrowserErrorCode; message: string } | null>;
+  controlGeneration: number;
   syntheticInput: number;
   bounds?: Electron.Rectangle;
   advancedReady: Promise<void>;
@@ -264,12 +272,14 @@ export class BrowserTabManager {
         canGoForward: false,
         crashed: false,
         control: "user",
-        advanced: settings.advancedBrowserMode.enabled,
+        advanced: false,
+        advancedProfile: profile.mode === "unsafe",
         createdAt: now,
         lastActiveAt: now,
       },
       queue: Promise.resolve(),
       pendingActions: new Map(),
+      controlGeneration: 0,
       syntheticInput: 0,
       advancedReady: Promise.resolve(),
       nativeUserAgent,
@@ -1491,7 +1501,7 @@ export class BrowserTabManager {
   ): Promise<BrowserNetworkBodyResult> {
     const record = this.requireOwnedTab(tabId, sessionId);
     await record.advancedReady;
-    return this.runAction(record, sessionId, "advanced", async () => {
+    return this.runAction(record, sessionId, "advanced", async (signal) => {
       const recorder = this.requireNetworkRecorder(record);
       recorder.armBodyCapture();
       try {
@@ -1505,14 +1515,21 @@ export class BrowserTabManager {
           allowAboutBlank: false,
           userApprovedPrivateNetwork: false,
         });
-        const response = await record.session.fetch(checked.url, {
-          method: "GET",
-          headers: replayHeaders(sealed.headers),
-          redirect: "error",
-        });
-        const data = Buffer.from(await response.arrayBuffer());
-        const mimeType = response.headers.get("content-type") ?? request.mimeType ?? "application/octet-stream";
-        return recorder.recordRefetchedBody(requestId, data, mimeType);
+        return runBoundedNetworkAction(
+          signal,
+          this.options.getSettings().navigation.actionTimeoutMs,
+          async (networkSignal) => {
+            const response = await record.session.fetch(checked.url, {
+              method: "GET",
+              headers: replayHeaders(sealed.headers),
+              redirect: "error",
+              signal: networkSignal,
+            });
+            const data = await readBoundedResponseBody(response, MAX_REPLAY_RESPONSE_BYTES, networkSignal);
+            const mimeType = response.headers.get("content-type") ?? request.mimeType ?? "application/octet-stream";
+            return recorder.recordRefetchedBody(requestId, data, mimeType);
+          },
+        );
       }
     });
   }
@@ -1529,7 +1546,7 @@ export class BrowserTabManager {
     }
     const record = this.requireOwnedTab(tabId, sessionId);
     await record.advancedReady;
-    return this.runAction(record, sessionId, "advanced", async () => {
+    return this.runAction(record, sessionId, "advanced", async (signal) => {
       const recorder = this.requireNetworkRecorder(record);
       recorder.armBodyCapture();
       const sealed = recorder.getSealedReplayRecord(requestId);
@@ -1554,61 +1571,68 @@ export class BrowserTabManager {
           `Replay ${method} to ${new URL(checked.url).origin} (${headers["content-type"] ?? "unknown content type"}, ${Buffer.byteLength(body ?? "")} bytes): ${reason.trim()}`,
         );
       }
-      let url = checked.url;
-      let response: Response | undefined;
-      for (let redirectCount = 0; redirectCount < 6; redirectCount += 1) {
-        try {
-          response = await record.session.fetch(url, {
-            method,
-            headers,
-            ...(body === undefined || method === "GET" || method === "HEAD" ? {} : { body }),
-            redirect: "manual",
-          });
-        } catch (error) {
-          if (/redirect.*(?:cancel|block)/i.test(error instanceof Error ? error.message : String(error))) {
-            throw new BrowserError("REQUEST_REPLAY_BLOCKED", "Browser request replay redirect was blocked");
+      return runBoundedNetworkAction(
+        signal,
+        this.options.getSettings().navigation.actionTimeoutMs,
+        async (networkSignal) => {
+          let url = checked.url;
+          let response: Response | undefined;
+          for (let redirectCount = 0; redirectCount < 6; redirectCount += 1) {
+            try {
+              response = await record.session.fetch(url, {
+                method,
+                headers,
+                ...(body === undefined || method === "GET" || method === "HEAD" ? {} : { body }),
+                redirect: "manual",
+                signal: networkSignal,
+              });
+            } catch (error) {
+              if (/redirect.*(?:cancel|block)/i.test(error instanceof Error ? error.message : String(error))) {
+                throw new BrowserError("REQUEST_REPLAY_BLOCKED", "Browser request replay redirect was blocked");
+              }
+              throw new BrowserError("REQUEST_REPLAY_NOT_AVAILABLE", "Browser request replay failed", {
+                retryable: false,
+                cause: error,
+              });
+            }
+            const location = response.headers.get("location");
+            if (!location || response.status < 300 || response.status >= 400) break;
+            const next = new URL(location, url);
+            if (next.origin !== new URL(url).origin) {
+              throw new BrowserError("REQUEST_REPLAY_BLOCKED", "Cross-origin request replay redirect was blocked");
+            }
+            if (method !== "GET" && method !== "HEAD") break;
+            url = (
+              await this.getNetworkPolicy(record).check(next.toString(), {
+                settings: this.options.getSettings().navigation,
+                allowAboutBlank: false,
+                userApprovedPrivateNetwork: false,
+              })
+            ).url;
           }
-          throw new BrowserError("REQUEST_REPLAY_NOT_AVAILABLE", "Browser request replay failed", {
-            retryable: false,
-            cause: error,
+          if (!response) throw new BrowserError("REQUEST_REPLAY_NOT_AVAILABLE", "Browser request replay failed");
+          const responseData = await readBoundedResponseBody(response, MAX_REPLAY_RESPONSE_BYTES, networkSignal);
+          const responseHeaders = Object.fromEntries(response.headers.entries());
+          const mimeType = response.headers.get("content-type") ?? "application/octet-stream";
+          const replayed = recorder.recordReplay({
+            replayedFrom: requestId,
+            method,
+            url,
+            requestHeaders: headers,
+            status: response.status,
+            statusText: response.statusText,
+            responseHeaders,
+            body: responseData,
+            mimeType,
           });
-        }
-        const location = response.headers.get("location");
-        if (!location || response.status < 300 || response.status >= 400) break;
-        const next = new URL(location, url);
-        if (next.origin !== new URL(url).origin) {
-          throw new BrowserError("REQUEST_REPLAY_BLOCKED", "Cross-origin request replay redirect was blocked");
-        }
-        if (method !== "GET" && method !== "HEAD") break;
-        url = (
-          await this.getNetworkPolicy(record).check(next.toString(), {
-            settings: this.options.getSettings().navigation,
-            allowAboutBlank: false,
-            userApprovedPrivateNetwork: false,
-          })
-        ).url;
-      }
-      if (!response) throw new BrowserError("REQUEST_REPLAY_NOT_AVAILABLE", "Browser request replay failed");
-      const responseData = Buffer.from(await response.arrayBuffer());
-      const responseHeaders = Object.fromEntries(response.headers.entries());
-      const mimeType = response.headers.get("content-type") ?? "application/octet-stream";
-      const replayed = recorder.recordReplay({
-        replayedFrom: requestId,
-        method,
-        url,
-        requestHeaders: headers,
-        status: response.status,
-        statusText: response.statusText,
-        responseHeaders,
-        body: responseData,
-        mimeType,
-      });
-      return {
-        request: replayed,
-        ...(responseData.byteLength
-          ? { responseBody: await recorder.body(replayed.requestId, { maxBytes: 512 * 1024 }) }
-          : {}),
-      };
+          return {
+            request: replayed,
+            ...(responseData.byteLength
+              ? { responseBody: await recorder.body(replayed.requestId, { maxBytes: 512 * 1024 }) }
+              : {}),
+          };
+        },
+      );
     });
   }
 
@@ -1701,7 +1725,7 @@ export class BrowserTabManager {
     for (const record of this.tabs.values()) {
       if (sessionId && record.info.ownerSessionId !== sessionId) continue;
       this.cancelAgentActions(record, "CAPABILITY_LEASE_EXPIRED", "Browser capability was revoked");
-      record.info.control = "user";
+      this.setUserControl(record);
       this.emitUpdate(record);
     }
     if (sessionId) this.inspections.clearSession(sessionId);
@@ -1756,10 +1780,8 @@ export class BrowserTabManager {
   }
 
   async applyAdvancedMode(): Promise<void> {
-    const advanced = this.options.getSettings().advancedBrowserMode.enabled;
     const pending: Promise<void>[] = [];
     for (const record of this.tabs.values()) {
-      record.info.advanced = advanced;
       const previous = record.advancedReady;
       record.advancedReady = previous.catch(() => undefined).then(() => this.prepareAdvancedRecord(record));
       pending.push(record.advancedReady);
@@ -1884,7 +1906,7 @@ export class BrowserTabManager {
       this.emitUpdate(record);
     });
     wc.on("before-input-event", (event, input) => {
-      if (input.key === "F12" || ((input.control || input.meta) && input.shift && input.key.toLowerCase() === "i")) {
+      if (isBrowserDevToolsShortcut(input)) {
         event.preventDefault();
         return;
       }
@@ -1965,9 +1987,9 @@ export class BrowserTabManager {
   }
 
   private handleUserInput(record: TabRecord): void {
-    if (record.syntheticInput > 0 || record.info.control !== "agent") return;
+    if (record.syntheticInput > 0 || record.info.control === "user") return;
     record.pendingFileUpload = undefined;
-    record.info.control = "user";
+    this.setUserControl(record);
     record.info.generation += 1;
     record.snapshot = undefined;
     this.inspections.clearTab(record.info.id);
@@ -1985,9 +2007,13 @@ export class BrowserTabManager {
   private async approveSensitiveAction(record: TabRecord, description: string): Promise<void> {
     const policy = this.options.getSettings().automation.sensitiveActions;
     if (policy === "deny") throw new BrowserError("PERMISSION_DENIED", "Sensitive Browser action is denied");
+    const controlGeneration = record.controlGeneration;
     record.info.control = "waiting-for-approval";
     this.emitUpdate(record);
     const accepted = await (this.options.confirmSensitiveAction?.(description) ?? Promise.resolve(false));
+    if (!canResumeSensitiveAgentControl(controlGeneration, record.controlGeneration, record.info.control)) {
+      throw new BrowserError("USER_TOOK_CONTROL", "User took control during sensitive Browser approval");
+    }
     record.info.control = "agent";
     this.emitUpdate(record);
     if (!accepted) throw new BrowserError("PERMISSION_DENIED", "Sensitive Browser action was not approved");
@@ -2177,7 +2203,7 @@ export class BrowserTabManager {
     void permission;
     if (!sessionId) {
       if (record.pendingActions.size > 0) {
-        record.info.control = "user";
+        this.setUserControl(record);
         record.info.generation += 1;
         record.snapshot = undefined;
         this.cancelAgentActions(record, "USER_TOOK_CONTROL", "User took control of the Browser tab");
@@ -2221,12 +2247,18 @@ export class BrowserTabManager {
       } finally {
         record.pendingActions.delete(abort);
         if (record.activeAbort === abort) record.activeAbort = undefined;
-        record.info.control = "user";
+        this.setUserControl(record);
+        record.info.advanced = false;
         this.emitUpdate(record);
       }
     };
     record.queue = record.queue.then(run, run);
     return result;
+  }
+
+  private setUserControl(record: TabRecord): void {
+    if (record.info.control !== "user") record.controlGeneration += 1;
+    record.info.control = "user";
   }
 
   private assertSnapshotRef(record: TabRecord, ref: string, snapshotId: string, generation: number): void {

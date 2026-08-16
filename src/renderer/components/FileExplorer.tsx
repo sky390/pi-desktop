@@ -1,7 +1,12 @@
 import { useState, useCallback, useEffect, useRef } from "react";
 import { getFileIcon, FolderIcon } from "./FileIcons";
 import { encodeFilePathForApi, getRelativeFilePath, joinFilePath } from "@/lib/file-paths";
+import { directoryRefreshAction, shouldLoadDirectoryOnExpand } from "@/lib/directory-refresh";
 import type { GitStatusResult } from "@shared/api-types";
+import { useI18n } from "@/i18n";
+import { formatNumber } from "@/lib/locale-format";
+
+type Translate = (key: string, fallback: string) => string;
 
 interface FileEntry {
   name: string;
@@ -26,11 +31,14 @@ interface Props {
   onAtMention?: (relativePath: string, isDir: boolean) => void;
 }
 
-async function fetchEntries(dirPath: string): Promise<FileNode[]> {
+async function fetchEntries(dirPath: string, t: Translate): Promise<FileNode[]> {
   const encoded = encodeFilePathForApi(dirPath);
   const res = await fetch(`/api/files/${encoded}?type=list`);
   if (!res.ok) {
-    let message = `Failed to load files (HTTP ${res.status})`;
+    let message = t("fileListLoadFailedStatus", "Failed to load files (HTTP {status})").replace(
+      "{status}",
+      String(res.status),
+    );
     try {
       const data = (await res.json()) as { error?: string };
       if (data.error) message = data.error;
@@ -69,9 +77,11 @@ function TreeNode({
   onToggleExpanded: (fullPath: string, open: boolean) => void;
   refreshKey?: number;
 }) {
+  const { t } = useI18n();
   const open = expandedPaths.has(node.fullPath);
   const [children, setChildren] = useState<FileNode[]>(node.children ?? []);
   const [loaded, setLoaded] = useState(node.loaded ?? false);
+  const [stale, setStale] = useState(false);
   const [loading, setLoading] = useState(false);
   const [hovered, setHovered] = useState(false);
   const [focusedWithin, setFocusedWithin] = useState(false);
@@ -79,31 +89,31 @@ function TreeNode({
 
   const loadChildren = useCallback(
     async (force = false) => {
-      if (loaded && !force) return;
+      if (loaded && !stale && !force) return;
       setLoading(true);
       try {
-        const entries = await fetchEntries(node.fullPath);
+        const entries = await fetchEntries(node.fullPath, t);
         setChildren(entries);
         setLoaded(true);
+        setStale(false);
       } catch {
         // ignore
       } finally {
         setLoading(false);
       }
     },
-    [loaded, node.fullPath],
+    [loaded, node.fullPath, stale, t],
   );
 
-  // When refreshKey causes a re-render with the same node identity, reload open dirs
-  const prevLoadedRef = useRef(loaded);
+  // Refresh open directories immediately; collapsed directories reload lazily on expansion.
   useEffect(() => {
-    prevLoadedRef.current = loaded;
-  });
-
-  // Re-fetch children when refreshKey changes and the directory is already open/loaded
-  useEffect(() => {
-    if (open && loaded) {
+    if (!node.isDir) return;
+    const refreshAction = directoryRefreshAction(open, loaded);
+    if (refreshAction === "reload") {
       void loadChildren(true);
+    } else if (refreshAction === "mark-stale") {
+      setLoaded(false);
+      setStale(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- refreshKey intentionally owns this refresh effect.
   }, [refreshKey]);
@@ -112,11 +122,11 @@ function TreeNode({
     if (node.isDir) {
       const next = !open;
       onToggleExpanded(node.fullPath, next);
-      if (next && !loaded) void loadChildren();
+      if (next && shouldLoadDirectoryOnExpand(loaded, stale)) void loadChildren();
     } else {
       onOpenFile(node.fullPath, node.name);
     }
-  }, [node.isDir, node.fullPath, node.name, loaded, open, loadChildren, onOpenFile, onToggleExpanded]);
+  }, [node.isDir, node.fullPath, node.name, loaded, stale, open, loadChildren, onOpenFile, onToggleExpanded]);
 
   return (
     <div>
@@ -137,7 +147,13 @@ function TreeNode({
           type="button"
           onClick={handleClick}
           aria-expanded={node.isDir ? open : undefined}
-          aria-label={node.isDir ? `${open ? "Collapse" : "Expand"} folder ${node.name}` : `Open file ${node.name}`}
+          aria-label={
+            node.isDir
+              ? open
+                ? t("collapseFolder", "Collapse folder {name}").replace("{name}", node.name)
+                : t("expandFolder", "Expand folder {name}").replace("{name}", node.name)
+              : t("openFile", "Open file {name}").replace("{name}", node.name)
+          }
           title={node.fullPath}
           style={{
             display: "flex",
@@ -208,7 +224,7 @@ function TreeNode({
               e.stopPropagation();
               onAtMention(getRelativeFilePath(node.fullPath, cwd), node.isDir);
             }}
-            title="Insert path into chat"
+            title={t("insertPathIntoChat", "Insert path into chat")}
             style={{
               position: "absolute",
               right: !node.isDir ? 40 : 4,
@@ -243,7 +259,7 @@ function TreeNode({
               <circle cx="12" cy="12" r="4" />
               <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
             </svg>
-            mention
+            {t("mention", "mention")}
           </button>
         )}
         {(hovered || focusedWithin) && !node.isDir && (
@@ -258,7 +274,7 @@ function TreeNode({
                 .catch((error) => console.error("download failed", error))
                 .finally(() => setDownloading(false));
             }}
-            title="Download file"
+            title={t("downloadFile", "Download file")}
             style={{
               position: "absolute",
               right: 4,
@@ -324,7 +340,7 @@ function TreeNode({
                 alignItems: "center",
               }}
             >
-              empty
+              {t("empty", "empty")}
             </div>
           )}
         </div>
@@ -334,6 +350,7 @@ function TreeNode({
 }
 
 export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props) {
+  const { language, t } = useI18n();
   const [roots, setRoots] = useState<FileNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -360,7 +377,7 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
       setError(null);
       try {
         const [entries, statusResponse] = await Promise.all([
-          fetchEntries(cwd),
+          fetchEntries(cwd, t),
           fetch(`/api/git-status?cwd=${encodeURIComponent(cwd)}`),
         ]);
         const status = statusResponse.ok ? ((await statusResponse.json()) as GitStatusResult) : null;
@@ -375,7 +392,7 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
         if (generation === loadGenerationRef.current) setLoading(false);
       }
     },
-    [cwd],
+    [cwd, t],
   );
 
   useEffect(() => {
@@ -410,7 +427,11 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
   }, [cwd, loadProject]);
 
   if (loading) {
-    return <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>Loading files...</div>;
+    return (
+      <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>
+        {t("loadingFiles", "Loading files…")}
+      </div>
+    );
   }
 
   if (error) {
@@ -432,7 +453,11 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
         }}
       >
         <span
-          title={watching ? "Project changes are monitored" : "Project watcher unavailable"}
+          title={
+            watching
+              ? t("projectChangesMonitored", "Project changes are monitored")
+              : t("projectWatcherUnavailable", "Project watcher unavailable")
+          }
           style={{
             width: 7,
             height: 7,
@@ -455,18 +480,40 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
               {gitStatus.branch ?? "detached"}
             </span>
             {gitStatus.clean ? (
-              <span style={{ color: "var(--success)" }}>clean</span>
+              <span style={{ color: "var(--success)" }}>{t("gitClean", "clean")}</span>
             ) : (
-              <span title={`${gitStatus.entries.length} changed paths`}>
-                {gitStatus.staged ? `+${gitStatus.staged} staged ` : ""}
-                {gitStatus.modified ? `${gitStatus.modified} modified ` : ""}
-                {gitStatus.untracked ? `${gitStatus.untracked} untracked ` : ""}
-                {gitStatus.conflicted ? `${gitStatus.conflicted} conflicted` : ""}
+              <span
+                title={t("changedPathCount", "{count} changed paths").replace(
+                  "{count}",
+                  formatNumber(gitStatus.entries.length, language),
+                )}
+              >
+                {gitStatus.staged
+                  ? t("gitStagedCount", "+{count} staged ").replace("{count}", formatNumber(gitStatus.staged, language))
+                  : ""}
+                {gitStatus.modified
+                  ? t("gitModifiedCount", "{count} modified ").replace(
+                      "{count}",
+                      formatNumber(gitStatus.modified, language),
+                    )
+                  : ""}
+                {gitStatus.untracked
+                  ? t("gitUntrackedCount", "{count} untracked ").replace(
+                      "{count}",
+                      formatNumber(gitStatus.untracked, language),
+                    )
+                  : ""}
+                {gitStatus.conflicted
+                  ? t("gitConflictedCount", "{count} conflicted").replace(
+                      "{count}",
+                      formatNumber(gitStatus.conflicted, language),
+                    )
+                  : ""}
               </span>
             )}
           </>
         ) : (
-          <span>{watching ? "live" : "static"}</span>
+          <span>{watching ? t("live", "live") : t("static", "static")}</span>
         )}
       </div>
       {roots.map((node) => (
@@ -483,7 +530,9 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
         />
       ))}
       {roots.length === 0 && (
-        <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>No files found</div>
+        <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>
+          {t("noFilesFound", "No files found")}
+        </div>
       )}
     </div>
   );

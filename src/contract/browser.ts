@@ -49,6 +49,7 @@ export type BrowserErrorCode =
   | "DOWNLOAD_DENIED"
   | "UPLOAD_DENIED"
   | "PROFILE_RECREATE_REQUIRED"
+  | "PROFILE_DELETE_RETRY_REQUIRED"
   | "CONSOLE_CURSOR_EXPIRED"
   | "VISUAL_COMPARE_UNAVAILABLE"
   | "INVALID_BROWSER_REQUEST";
@@ -275,7 +276,10 @@ export interface BrowserTabInfo {
   canGoForward: boolean;
   crashed: boolean;
   control: BrowserControlState;
+  /** True only while an Agent advanced action is executing. */
   advanced: boolean;
+  /** True when the tab uses an unsafe Profile and must not be restored. */
+  advancedProfile: boolean;
   createdAt: number;
   lastActiveAt: number;
 }
@@ -627,6 +631,8 @@ export interface BrowserHeaderRule {
   operation: "set" | "remove" | "append";
   value?: string;
   secretRef?: string;
+  source?: "local" | "agent";
+  ownerSessionId?: string;
 }
 
 export interface BrowserProxyCredentialsInput {

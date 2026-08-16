@@ -1,16 +1,13 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtempSync } from "node:fs";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
-
-const output = path.join(import.meta.dirname, "../../../.artifacts/test-modules", `channel-manager-${process.pid}.mjs`);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
+const { AdapterRegistry, ChannelManager } = await importTestBundle("src/agent-host/channels/channel-manager", {
+  packages: "external",
   stdin: {
     contents: [
       'export { AdapterRegistry } from "./adapter-registry.ts";',
@@ -20,25 +17,28 @@ await build({
     sourcefile: "channel-manager-test-entry.ts",
     loader: "ts",
   },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
 });
-const { AdapterRegistry, ChannelManager } = await import(`${pathToFileURL(output).href}?v=${Date.now()}`);
 
 function createFakeAdapter(id = "weixin") {
   let inbound;
+  let startCount = 0;
+  let activeCount = 0;
+  let maxActiveCount = 0;
   const sent = [];
   return {
     adapter: {
       id,
       async start(context) {
+        startCount += 1;
+        activeCount += 1;
+        maxActiveCount = Math.max(maxActiveCount, activeCount);
         inbound = context.onInbound;
         context.onStatus({ state: "running", connected: true });
-        await new Promise((resolve) => context.signal.addEventListener("abort", resolve, { once: true }));
+        try {
+          await new Promise((resolve) => context.signal.addEventListener("abort", resolve, { once: true }));
+        } finally {
+          activeCount -= 1;
+        }
       },
       async send(context) {
         sent.push(context);
@@ -65,12 +65,108 @@ function createFakeAdapter(id = "weixin") {
     },
     emit: async (envelope) => inbound(envelope),
     sent,
+    get startCount() {
+      return startCount;
+    },
+    get activeCount() {
+      return activeCount;
+    },
+    get maxActiveCount() {
+      return maxActiveCount;
+    },
   };
 }
 
 function scanAccountId(domain, appId) {
   return `feishu-${createHash("sha256").update(`${domain}\0${appId}`).digest("hex").slice(0, 24)}`;
 }
+
+test("concurrent starts create only one adapter runtime per account", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-channel-manager-concurrent-start-"));
+  const fake = createFakeAdapter();
+  const registry = new AdapterRegistry();
+  registry.register(fake.adapter);
+  let blockSecretReads = false;
+  let blockedSecretReads = 0;
+  let releaseSecretReads;
+  let secretGate = Promise.resolve();
+  const manager = new ChannelManager({ handle() {}, attachPort() {}, detachPort() {}, emit() {} }, () => {}, {
+    dataDirectory: dir,
+    registry,
+    secretAccess: {
+      get: async () => {
+        if (blockSecretReads) {
+          blockedSecretReads += 1;
+          await secretGate;
+        }
+        return { token: "token", providerAccountId: "raw", baseUrl: "https://example.test" };
+      },
+      set: async () => {},
+      delete: async () => {},
+    },
+    bridge: { async runTurn() {} },
+  });
+  const now = new Date().toISOString();
+  await manager.upsertAccount({
+    id: "wx-concurrent",
+    channel: "weixin",
+    name: "Concurrent Weixin",
+    enabled: true,
+    dmPolicy: "open",
+    allowFrom: [],
+    groupPolicy: "disabled",
+    groupIds: [],
+    groupAllowFrom: [],
+    requireMention: true,
+    toolNames: [],
+    createdAt: now,
+    updatedAt: now,
+  });
+  await manager.stopAccount("wx-concurrent");
+
+  blockSecretReads = true;
+  secretGate = new Promise((resolve) => {
+    releaseSecretReads = resolve;
+  });
+  const starts = Array.from({ length: 20 }, () => manager.startAccount("wx-concurrent"));
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseSecretReads();
+  await Promise.all(starts);
+
+  assert.equal(blockedSecretReads, 1);
+  assert.equal(fake.startCount, 2, "setup and concurrent calls should create two runtimes in total");
+  assert.equal(fake.activeCount, 1);
+  assert.equal(fake.maxActiveCount, 1);
+
+  await manager.stopAccount("wx-concurrent");
+  secretGate = new Promise((resolve) => {
+    releaseSecretReads = resolve;
+  });
+  const pendingStart = manager.startAccount("wx-concurrent");
+  await new Promise((resolve) => setImmediate(resolve));
+  const pendingStop = manager.stopAccount("wx-concurrent");
+  releaseSecretReads();
+  await Promise.all([pendingStart, pendingStop]);
+  assert.equal(fake.startCount, 2, "a stop during credential lookup must cancel the pending adapter launch");
+  assert.equal(fake.activeCount, 0);
+  await manager.shutdown();
+});
+
+test("initialization can retry after a transient media directory failure", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-channel-manager-init-retry-"));
+  const mediaPath = path.join(dir, "channel-media");
+  await writeFile(mediaPath, "temporarily blocked");
+  const manager = new ChannelManager({ handle() {}, attachPort() {}, detachPort() {}, emit() {} }, () => {}, {
+    dataDirectory: dir,
+  });
+
+  await assert.rejects(manager.initialize(), /EEXIST|媒体暂存目录不是安全的本地目录/);
+  await rm(mediaPath, { force: true });
+  await manager.initialize();
+  const info = await stat(mediaPath);
+  assert.equal(info.isDirectory(), true);
+  await manager.shutdown();
+});
 
 test("fake adapter runs inbound message through binding, Pi bridge, and delivery", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "pi-channel-manager-"));
@@ -176,6 +272,95 @@ test("fake adapter runs inbound message through binding, Pi bridge, and delivery
   await manager.shutdown();
 });
 
+test("account tool changes update bindings and synchronize their existing sessions", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-channel-manager-default-tools-"));
+  const fake = createFakeAdapter("telegram");
+  const registry = new AdapterRegistry();
+  registry.register(fake.adapter);
+  const bindingsSeen = [];
+  const toolSyncs = [];
+  const manager = new ChannelManager({ handle() {}, attachPort() {}, detachPort() {}, emit() {} }, () => {}, {
+    dataDirectory: dir,
+    registry,
+    secretAccess: {
+      get: async () => ({ token: "token", providerAccountId: "bot", baseUrl: "https://example.test" }),
+      set: async () => {},
+      delete: async () => {},
+    },
+    bridge: {
+      async syncTools(binding, toolNames) {
+        toolSyncs.push({ peerId: binding.peerId, sessionId: binding.sessionId, toolNames: [...toolNames] });
+      },
+      async runTurn(binding, _envelope, _onProgress, _attachments, newSessionToolNames) {
+        bindingsSeen.push({
+          peerId: binding.peerId,
+          bindingToolNames: [...binding.toolNames],
+          newSessionToolNames: [...newSessionToolNames],
+        });
+        return {
+          sessionId: binding.sessionId ?? `session-${binding.peerId}`,
+          cwd: binding.cwd,
+          finalText: "ok",
+          generatedFiles: [],
+        };
+      },
+    },
+  });
+  const now = new Date().toISOString();
+  const account = {
+    id: "telegram-default-tools",
+    channel: "telegram",
+    name: "Default tools bot",
+    enabled: true,
+    providerAccountId: "bot",
+    dmPolicy: "open",
+    allowFrom: [],
+    groupPolicy: "disabled",
+    groupIds: [],
+    groupAllowFrom: [],
+    requireMention: true,
+    toolNames: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  const envelope = (id, peerId) => ({
+    id,
+    channel: "telegram",
+    accountId: account.id,
+    peer: { kind: "dm", id: peerId },
+    sender: { id: peerId },
+    text: "test",
+    mentionsBot: false,
+    attachments: [],
+    timestamp: Date.now(),
+  });
+
+  await manager.upsertAccount(account);
+  await fake.emit(envelope("before-update", "user-one"));
+
+  const fullTools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+  await manager.upsertAccount({ ...account, toolNames: fullTools });
+  await fake.emit(envelope("existing-after-update", "user-one"));
+  await fake.emit(envelope("new-after-update", "user-two"));
+
+  assert.deepEqual(bindingsSeen, [
+    { peerId: "user-one", bindingToolNames: [], newSessionToolNames: [] },
+    { peerId: "user-one", bindingToolNames: fullTools, newSessionToolNames: fullTools },
+    { peerId: "user-two", bindingToolNames: fullTools, newSessionToolNames: fullTools },
+  ]);
+  assert.deepEqual(toolSyncs, [{ peerId: "user-one", sessionId: "session-user-one", toolNames: fullTools }]);
+  const snapshot = await manager.snapshot();
+  assert.deepEqual(snapshot.accounts[0].toolNames, fullTools);
+  assert.deepEqual(
+    snapshot.bindings.map((binding) => [binding.peerId, binding.toolNames]),
+    [
+      ["user-one", fullTools],
+      ["user-two", fullTools],
+    ],
+  );
+  await manager.shutdown();
+});
+
 test("accepted media is staged privately and passed to the existing Pi turn", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "pi-channel-manager-media-"));
   const fake = createFakeAdapter("telegram");
@@ -218,6 +403,7 @@ test("accepted media is staged privately and passed to the existing Pi turn", as
     groupAllowFrom: [],
     requireMention: true,
     toolNames: [],
+    defaultCwd: path.join(dir, "workspace"),
     createdAt: now,
     updatedAt: now,
   });
@@ -283,6 +469,7 @@ test("Feishu generated files use the shared outbound capability and preserve the
     groupAllowFrom: [],
     requireMention: true,
     toolNames: [],
+    defaultCwd: path.join(dir, "workspace"),
     createdAt: now,
     updatedAt: now,
   });
@@ -485,8 +672,8 @@ test("opt-in IM commands execute locally while unknown and disabled commands rem
         getSessionStatus(binding) {
           return { hasSession: Boolean(binding.sessionId), running: false };
         },
-        async newSession() {
-          commandCalls.push({ command: "new" });
+        async newSession(_binding, toolNames) {
+          commandCalls.push({ command: "new", toolNames: [...toolNames] });
           return { sessionId: "session-command" };
         },
         async runCommand(_binding, command, customInstructions) {
@@ -501,6 +688,7 @@ test("opt-in IM commands execute locally while unknown and disabled commands rem
     },
   );
   const now = new Date().toISOString();
+  const fullTools = ["read", "bash", "edit", "write", "grep", "find", "ls"];
   const account = {
     id: "wx-commands",
     channel: "weixin",
@@ -514,7 +702,7 @@ test("opt-in IM commands execute locally while unknown and disabled commands rem
     requireMention: true,
     commandsEnabled: true,
     defaultCwd: path.join(dir, "workspace"),
-    toolNames: [],
+    toolNames: fullTools,
     createdAt: now,
     updatedAt: now,
   };
@@ -543,7 +731,7 @@ test("opt-in IM commands execute locally while unknown and disabled commands rem
   await send("/compact keep decisions");
   await send("/reload");
   assert.deepEqual(commandCalls, [
-    { command: "new" },
+    { command: "new", toolNames: fullTools },
     { command: "compact", customInstructions: "keep decisions" },
     { command: "reload", customInstructions: undefined },
   ]);

@@ -7,6 +7,8 @@ import type {
   ChannelLoginEvent,
   ChannelProbeResult,
   ChannelStatus,
+  ChannelActivity,
+  ChannelRuntimeState,
   ChannelsSnapshot,
   FeishuDomain,
 } from "@shared/channel-types";
@@ -43,7 +45,7 @@ function buttonStyle(primary = false): React.CSSProperties {
     border: `1px solid ${primary ? "var(--accent)" : "var(--border)"}`,
     borderRadius: 6,
     background: primary ? "var(--accent)" : "var(--bg)",
-    color: primary ? "white" : "var(--text-muted)",
+    color: primary ? "var(--on-accent)" : "var(--text-muted)",
     minHeight: 36,
     fontSize: 13,
     padding: "0 12px",
@@ -67,13 +69,52 @@ function statusFor(snapshot: ChannelsSnapshot, accountId: string): ChannelStatus
 }
 
 function statusColor(status?: ChannelStatus): string {
-  if (status?.state === "running") return "#22c55e";
-  if (status?.state === "starting" || status?.state === "reconnecting") return "#f59e0b";
-  if (status?.state === "error") return "#ef4444";
+  if (status?.state === "running") return "var(--success)";
+  if (status?.state === "starting" || status?.state === "reconnecting") return "var(--warning)";
+  if (status?.state === "error") return "var(--danger)";
   return "var(--text-dim)";
 }
 
 type Translate = (key: string, fallback: string) => string;
+
+function channelStatusLabel(status: ChannelRuntimeState, t: Translate): string {
+  switch (status) {
+    case "starting":
+      return t("channelStatus_starting", "starting");
+    case "running":
+      return t("channelStatus_running", "running");
+    case "reconnecting":
+      return t("channelStatus_reconnecting", "reconnecting");
+    case "stopped":
+      return t("channelStatus_stopped", "stopped");
+    case "error":
+      return t("channelStatus_error", "error");
+  }
+}
+
+function activityDirectionLabel(direction: ChannelActivity["direction"], t: Translate): string {
+  switch (direction) {
+    case "inbound":
+      return t("activityDirection_inbound", "inbound");
+    case "outbound":
+      return t("activityDirection_outbound", "outbound");
+    case "system":
+      return t("activityDirection_system", "system");
+  }
+}
+
+function activityOutcomeLabel(outcome: ChannelActivity["outcome"], t: Translate): string {
+  switch (outcome) {
+    case "accepted":
+      return t("activityOutcome_accepted", "accepted");
+    case "ignored":
+      return t("activityOutcome_ignored", "ignored");
+    case "sent":
+      return t("activityOutcome_sent", "sent");
+    case "failed":
+      return t("activityOutcome_failed", "failed");
+  }
+}
 
 function channelLabel(channel: ChannelAccountConfig["channel"], t: Translate, domain?: FeishuDomain): string {
   if (channel === "telegram") return "Telegram";
@@ -311,7 +352,9 @@ export function ChannelsConfig({ onSnapshotChange }: { onSnapshotChange?: (snaps
       <div style={{ maxWidth: 820, margin: "0 auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16 }}>
           <div>
-            <h2 style={{ margin: 0, color: "var(--text)", fontSize: 16 }}>{t("channels", "Messaging channels")}</h2>
+            <h2 style={{ margin: 0, color: "var(--text)", fontSize: 16 }}>
+              {t("messagingChannels", "Messaging channels")}
+            </h2>
             <p style={{ margin: "6px 0 0", color: "var(--text-dim)", fontSize: 12, lineHeight: 1.6 }}>
               {t("channelsDescription", "Connect IM accounts, control access, and bind conversations to Pi sessions.")}
             </p>
@@ -349,9 +392,9 @@ export function ChannelsConfig({ onSnapshotChange }: { onSnapshotChange?: (snaps
           <div
             style={{
               marginTop: 14,
-              border: "1px solid #ef444466",
-              background: "#ef444414",
-              color: "#ef4444",
+              border: "1px solid var(--danger-border)",
+              background: "var(--danger-soft)",
+              color: "var(--danger)",
               borderRadius: 7,
               padding: 10,
               fontSize: 12,
@@ -687,7 +730,7 @@ export function AccountCard({
           <div>
             <div style={{ color: "var(--text)", fontSize: 13, fontWeight: 700 }}>{account.name}</div>
             <div style={{ color: statusColor(status), fontSize: 11, marginTop: 2 }}>
-              {t(`channelStatus_${status?.state ?? "stopped"}`, status?.state ?? "stopped")} ·{" "}
+              {channelStatusLabel(status?.state ?? "stopped", t)} ·{" "}
               {account.credentialFingerprint ?? t("notConfigured", "not configured")}
             </div>
             <div style={{ color: "var(--text-dim)", fontSize: 10, marginTop: 2 }}>
@@ -708,7 +751,9 @@ export function AccountCard({
         </label>
       </div>
 
-      {status?.lastError && <div style={{ color: "#ef4444", fontSize: 11, marginTop: 10 }}>{status.lastError}</div>}
+      {status?.lastError && (
+        <div style={{ color: "var(--danger)", fontSize: 11, marginTop: 10 }}>{status.lastError}</div>
+      )}
 
       <div
         style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(190px,1fr))", gap: 10, marginTop: 14 }}
@@ -832,6 +877,12 @@ export function AccountCard({
             <option value="read">{t("toolPresetRead", "Read-only tools")}</option>
             <option value="full">{t("toolPresetFull", "Full coding tools")}</option>
           </select>
+          <span style={{ color: "var(--text-dim)", fontSize: 10, lineHeight: 1.5 }}>
+            {t(
+              "defaultToolsHint",
+              "Used for new channel sessions and synchronized to sessions currently bound to this account when saved.",
+            )}
+          </span>
         </Field>
         <Field label={t("defaultProjectDirectory", "Default project directory")}>
           <div style={{ display: "flex", gap: 6 }}>
@@ -995,7 +1046,7 @@ export function AccountCard({
         >
           {probing ? t("testingConnection", "Testing…") : t("testConnection", "Test connection")}
         </button>
-        <button type="button" disabled={busy} style={{ ...buttonStyle(), color: "#ef4444" }} onClick={onDelete}>
+        <button type="button" disabled={busy} style={{ ...buttonStyle(), color: "var(--danger)" }} onClick={onDelete}>
           {t("delete", "Delete")}
         </button>
       </div>
@@ -1007,10 +1058,10 @@ export function AccountCard({
           style={{
             marginTop: 9,
             padding: "7px 9px",
-            border: `1px solid ${probeFeedback.ok ? "#22c55e55" : "#ef444455"}`,
+            border: `1px solid ${probeFeedback.ok ? "var(--success-border)" : "var(--danger-border)"}`,
             borderRadius: 6,
-            background: probeFeedback.ok ? "#22c55e12" : "#ef444412",
-            color: probeFeedback.ok ? "#16a34a" : "#ef4444",
+            background: probeFeedback.ok ? "var(--success-soft)" : "var(--danger-soft)",
+            color: probeFeedback.ok ? "var(--success)" : "var(--danger)",
             fontSize: 11,
           }}
         >
@@ -1197,7 +1248,7 @@ function BindingRow({
         </button>
         <button
           disabled={busy}
-          style={{ ...buttonStyle(), color: "#ef4444" }}
+          style={{ ...buttonStyle(), color: "var(--danger)" }}
           onClick={() => void run(() => call("channels.bindingDelete", { bindingId: binding.id }))}
           title={t("deleteBinding", "Delete binding")}
           aria-label={t("deleteBinding", "Delete binding")}
@@ -1282,10 +1333,9 @@ function ActivitySection({ snapshot }: { snapshot: ChannelsSnapshot }) {
                   fontSize: 11,
                 }}
               >
-                <span style={{ color: activity.outcome === "failed" ? "#ef4444" : "var(--text-muted)" }}>
-                  {channelLabel(activity.channel, t)} ·{" "}
-                  {t(`activityDirection_${activity.direction}`, activity.direction)} ·{" "}
-                  {t(`activityOutcome_${activity.outcome}`, activity.outcome)}
+                <span style={{ color: activity.outcome === "failed" ? "var(--danger)" : "var(--text-muted)" }}>
+                  {channelLabel(activity.channel, t)} · {activityDirectionLabel(activity.direction, t)} ·{" "}
+                  {activityOutcomeLabel(activity.outcome, t)}
                   {activity.peerId ? ` · ${activity.peerId}` : ""}
                   {activity.detail ? ` · ${activity.detail}` : ""}
                 </span>
@@ -1367,7 +1417,7 @@ export function TelegramTokenDialog({
           <div
             role="alert"
             data-testid="telegram-connect-error"
-            style={{ marginTop: 10, color: "#ef4444", fontSize: 11, lineHeight: 1.5, overflowWrap: "anywhere" }}
+            style={{ marginTop: 10, color: "var(--danger)", fontSize: 11, lineHeight: 1.5, overflowWrap: "anywhere" }}
           >
             {error}
           </div>
@@ -1550,7 +1600,7 @@ function FeishuDialogError({ error }: { error: string }) {
     <div
       role="alert"
       data-testid="feishu-connect-error"
-      style={{ marginTop: 10, color: "#ef4444", fontSize: 11, lineHeight: 1.5, overflowWrap: "anywhere" }}
+      style={{ marginTop: 10, color: "var(--danger)", fontSize: 11, lineHeight: 1.5, overflowWrap: "anywhere" }}
     >
       {error}
     </div>
@@ -1670,7 +1720,7 @@ function FeishuManualForm({
           {FEISHU_PERMISSION_IMPORT_JSON}
         </pre>
         {permissionCopyState === "error" && (
-          <div role="alert" style={{ marginTop: 6, color: "#ef4444" }}>
+          <div role="alert" style={{ marginTop: 6, color: "var(--danger)" }}>
             {t("feishuPermissionCopyFailed", "Copy failed. Select and copy the JSON above manually.")}
           </div>
         )}
@@ -1765,7 +1815,9 @@ export function LoginDialog({
         }}
       >
         <h3 style={{ margin: 0, color: "var(--text)", fontSize: 16 }}>
-          {isFeishu ? t("feishuScanCreate", "Scan to create Feishu / Lark bot") : t("connectWeixin", "Connect WeChat")}
+          {isFeishu
+            ? t("feishuScanCreateTitle", "Scan to create Feishu / Lark bot")
+            : t("connectWeixin", "Connect WeChat")}
         </h3>
         {event.qrContent && !terminal && (
           <div
@@ -1796,7 +1848,13 @@ export function LoginDialog({
             {t("qrCodeExpiresIn", "QR code expires in")} {remainingSeconds}s
           </div>
         )}
-        <p style={{ color: event.phase === "error" ? "#ef4444" : "var(--text-muted)", fontSize: 12, lineHeight: 1.6 }}>
+        <p
+          style={{
+            color: event.phase === "error" ? "var(--danger)" : "var(--text-muted)",
+            fontSize: 12,
+            lineHeight: 1.6,
+          }}
+        >
           {event.message}
         </p>
         {event.phase === "verification_required" && (

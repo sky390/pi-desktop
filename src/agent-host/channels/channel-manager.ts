@@ -31,6 +31,7 @@ import { resolveSessionPath } from "../session-reader";
 import { sessionIndex } from "../session-index";
 
 type RuntimeEntry = { controller: AbortController; task: Promise<void> };
+type StartingEntry = { controller: AbortController; task: Promise<void> };
 type SecretAccess = {
   get: (channel: ChannelId, accountId: string) => Promise<ChannelSecret | null>;
   set: (channel: ChannelId, accountId: string, secret: ChannelSecret) => Promise<void>;
@@ -41,7 +42,7 @@ export type ChannelManagerOptions = {
   dataDirectory?: string;
   registry?: AdapterRegistry;
   secretAccess?: SecretAccess;
-  bridge?: Pick<PiSessionBridge, "getSessionStatus" | "newSession" | "runCommand" | "runTurn">;
+  bridge?: Pick<PiSessionBridge, "getSessionStatus" | "newSession" | "runCommand" | "runTurn" | "syncTools">;
 };
 
 const PAIRING_TTL_MS = 10 * 60_000;
@@ -51,6 +52,10 @@ function channelDisplayName(channel: ChannelId): string {
   if (channel === "weixin") return "微信";
   if (channel === "telegram") return "Telegram";
   return "飞书 / Lark";
+}
+
+function sameToolNames(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((name, index) => name === right[index]);
 }
 
 function userDataPath(): string {
@@ -126,9 +131,13 @@ export class ChannelManager {
   private readonly registry: AdapterRegistry;
   private readonly lanes = new LaneScheduler();
   private readonly media: ChannelMediaStore;
-  private readonly bridge: Pick<PiSessionBridge, "getSessionStatus" | "newSession" | "runCommand" | "runTurn">;
+  private readonly bridge: Pick<
+    PiSessionBridge,
+    "getSessionStatus" | "newSession" | "runCommand" | "runTurn" | "syncTools"
+  >;
   private readonly secretAccess: SecretAccess;
   private readonly runtimes = new Map<string, RuntimeEntry>();
+  private readonly starting = new Map<string, StartingEntry>();
   private readonly statuses = new Map<string, ChannelStatus>();
   private readonly loginWaits = new Map<string, Promise<ChannelLoginEvent>>();
   private readonly loginWaitCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -170,12 +179,16 @@ export class ChannelManager {
 
   initialize(): Promise<void> {
     if (!this.initialized) {
-      this.initialized = (async () => {
+      const attempt = (async () => {
         await this.media.initialize();
         for (const account of this.config.listAccounts()) {
           if (account.enabled) await this.startAccount(account.id).catch(() => undefined);
         }
       })();
+      this.initialized = attempt;
+      void attempt.catch(() => {
+        if (this.initialized === attempt) this.initialized = null;
+      });
     }
     return this.initialized;
   }
@@ -252,7 +265,23 @@ export class ChannelManager {
   }
 
   async upsertAccount(account: ChannelAccountConfig): Promise<ChannelsSnapshot> {
+    const previous = this.config.getAccount(account.id);
     const saved = this.config.upsertAccount(account);
+    if (previous && !sameToolNames(previous.toolNames, saved.toolNames)) {
+      const syncedSessionIds = new Set<string>();
+      for (const binding of this.config.listBindings()) {
+        if (binding.accountId !== saved.id) continue;
+        const updatedBinding = this.config.upsertBinding({ ...binding, toolNames: saved.toolNames });
+        this.server.emit("channels.binding", updatedBinding.id, {
+          action: "upsert",
+          bindingId: updatedBinding.id,
+          binding: updatedBinding,
+        });
+        if (!updatedBinding.sessionId || syncedSessionIds.has(updatedBinding.sessionId)) continue;
+        syncedSessionIds.add(updatedBinding.sessionId);
+        await this.bridge.syncTools(updatedBinding, saved.toolNames);
+      }
+    }
     if (saved.enabled) await this.restartAccount(saved.id);
     else await this.stopAccount(saved.id);
     return this.snapshot();
@@ -307,13 +336,27 @@ export class ChannelManager {
     if (!account) throw new Error("Channel account not found");
     if (!account.enabled) throw new Error("Channel account is disabled");
     if (this.runtimes.has(accountId)) return;
+    const pending = this.starting.get(accountId);
+    if (pending) return pending.task;
+    const controller = new AbortController();
+    const task = this.startAccountRuntime(account, controller);
+    const entry = { controller, task };
+    this.starting.set(accountId, entry);
+    try {
+      await task;
+    } finally {
+      if (this.starting.get(accountId) === entry) this.starting.delete(accountId);
+    }
+  }
+
+  private async startAccountRuntime(account: ChannelAccountConfig, controller: AbortController): Promise<void> {
     const secret = await this.getSecret(account);
+    if (controller.signal.aborted) return;
     if (!secret) {
       const message = "消息渠道账号尚未配置凭证";
       this.emitStatus(account, { state: "error", connected: false, lastError: message });
       throw new Error(message);
     }
-    const controller = new AbortController();
     const adapter = this.registry.get(account.channel);
     this.emitStatus(account, { state: "starting", connected: false, lastError: undefined });
     const task = adapter
@@ -340,12 +383,18 @@ export class ChannelManager {
         }
       })
       .finally(() => {
-        if (this.runtimes.get(accountId)?.controller === controller) this.runtimes.delete(accountId);
+        if (this.runtimes.get(account.id)?.controller === controller) this.runtimes.delete(account.id);
       });
-    this.runtimes.set(accountId, { controller, task });
+    this.runtimes.set(account.id, { controller, task });
   }
 
   async stopAccount(accountId: string): Promise<void> {
+    const starting = this.starting.get(accountId);
+    if (starting) {
+      starting.controller.abort();
+      await starting.task.catch(() => undefined);
+      if (this.starting.get(accountId) === starting) this.starting.delete(accountId);
+    }
     const runtime = this.runtimes.get(accountId);
     if (runtime) {
       runtime.controller.abort();
@@ -724,7 +773,7 @@ export class ChannelManager {
     }
 
     if (command.name === "new") {
-      const created = await this.bridge.newSession(binding);
+      const created = await this.bridge.newSession(binding, account.toolNames);
       return {
         sessionId: created.sessionId,
         notifySession: true,
@@ -916,6 +965,7 @@ export class ChannelManager {
                 envelope,
                 (event) => progressiveOutput?.update(event),
                 stagedAttachments,
+                account.toolNames,
               )),
               notifySession: true,
             };
@@ -1031,5 +1081,6 @@ export class ChannelManager {
     for (const timer of this.loginWaitCleanupTimers.values()) clearTimeout(timer);
     this.loginWaitCleanupTimers.clear();
     this.loginWaits.clear();
+    await this.media.dispose();
   }
 }

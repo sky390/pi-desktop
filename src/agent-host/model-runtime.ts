@@ -10,12 +10,24 @@ type RefreshableRuntime = {
 
 type RuntimeServices = { modelRuntime: RefreshableRuntime };
 
+export type ModelCatalogRefreshOutcome<T extends RuntimeServices> = {
+  services: T;
+  catalog: ModelCatalogStatus;
+};
+
+type ModelCatalogRefreshProjector<T extends RuntimeServices, R> = (
+  outcome: ModelCatalogRefreshOutcome<T>,
+  signal: AbortSignal,
+) => R | Promise<R>;
+
 type ActiveRefresh = {
   requestId: string;
   cwd: string;
   controller: AbortController;
   abortKind?: "cancelled" | "replaced" | "timeout";
 };
+
+type ModelCatalogTimers = Pick<typeof globalThis, "setTimeout" | "clearTimeout">;
 
 export class ModelCatalogRefreshAbortedError extends Error {
   constructor(readonly kind: "cancelled" | "replaced" | "timeout") {
@@ -41,13 +53,26 @@ export class ModelCatalogRefreshCoordinator {
   constructor(
     private readonly timeoutMs = MODEL_CATALOG_REFRESH_TIMEOUT_MS,
     private readonly isOffline: () => boolean = () => process.env.PI_OFFLINE !== undefined,
+    private readonly timers: ModelCatalogTimers = globalThis,
   ) {}
 
   async refresh<T extends RuntimeServices>(
     cwd: string,
     requestId: string,
     createServices: (signal: AbortSignal) => Promise<T>,
-  ): Promise<{ services: T; catalog: ModelCatalogStatus }> {
+  ): Promise<ModelCatalogRefreshOutcome<T>>;
+  async refresh<T extends RuntimeServices, R>(
+    cwd: string,
+    requestId: string,
+    createServices: (signal: AbortSignal) => Promise<T>,
+    project: ModelCatalogRefreshProjector<T, R>,
+  ): Promise<R>;
+  async refresh<T extends RuntimeServices, R>(
+    cwd: string,
+    requestId: string,
+    createServices: (signal: AbortSignal) => Promise<T>,
+    project?: ModelCatalogRefreshProjector<T, R>,
+  ): Promise<ModelCatalogRefreshOutcome<T> | R> {
     this.abort(this.byRequestId.get(requestId), "replaced");
     this.abort(this.byCwd.get(cwd), "replaced");
 
@@ -59,11 +84,14 @@ export class ModelCatalogRefreshCoordinator {
     this.byRequestId.set(requestId, active);
     this.byCwd.set(cwd, active);
 
-    const timer = setTimeout(() => this.abort(active, "timeout"), this.timeoutMs);
+    const timer = this.timers.setTimeout(() => this.abort(active, "timeout"), this.timeoutMs);
     let services: T | undefined;
-    const aborted = new Promise<"aborted">((resolve) => {
-      active.controller.signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+    const abortedMarker = Symbol("model-catalog-refresh-aborted");
+    const aborted = new Promise<typeof abortedMarker>((resolve) => {
+      active.controller.signal.addEventListener("abort", () => resolve(abortedMarker), { once: true });
     });
+    const finish = async (outcome: ModelCatalogRefreshOutcome<T>): Promise<ModelCatalogRefreshOutcome<T> | R> =>
+      project ? project(outcome, active.controller.signal) : outcome;
 
     try {
       const operation = (async () => {
@@ -71,10 +99,10 @@ export class ModelCatalogRefreshCoordinator {
         if (active.controller.signal.aborted)
           throw new ModelCatalogRefreshAbortedError(active.abortKind ?? "cancelled");
         if (this.isOffline()) {
-          return {
+          return finish({
             services,
             catalog: { source: "offline", refreshed: false, aborted: false, warnings: [] } satisfies ModelCatalogStatus,
-          };
+          });
         }
 
         const result = await services.modelRuntime.refresh({
@@ -82,7 +110,7 @@ export class ModelCatalogRefreshCoordinator {
           force: true,
           signal: active.controller.signal,
         });
-        return {
+        return finish({
           services,
           catalog: {
             source: "network",
@@ -90,13 +118,13 @@ export class ModelCatalogRefreshCoordinator {
             aborted: result.aborted,
             warnings: providerWarnings(result.errors),
           } satisfies ModelCatalogStatus,
-        };
+        });
       })();
       const outcome = await Promise.race([operation, aborted]);
-      if (outcome !== "aborted") return outcome;
+      if (outcome !== abortedMarker) return outcome;
       if (!services) throw new ModelCatalogRefreshAbortedError(active.abortKind ?? "cancelled");
       const timedOut = active.abortKind === "timeout";
-      return {
+      return finish({
         services,
         catalog: {
           source: "network",
@@ -112,9 +140,9 @@ export class ModelCatalogRefreshCoordinator {
               ]
             : [],
         },
-      };
+      });
     } finally {
-      clearTimeout(timer);
+      this.timers.clearTimeout(timer);
       if (this.byRequestId.get(requestId) === active) this.byRequestId.delete(requestId);
       if (this.byCwd.get(cwd) === active) this.byCwd.delete(cwd);
     }

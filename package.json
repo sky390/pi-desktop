@@ -1,19 +1,24 @@
 {
   "name": "@sky390/pi-desktop",
   "version": "0.1.10",
+  "private": true,
   "description": "Pi Agent Desktop — pure Electron desktop app for the pi coding agent",
   "homepage": "https://github.com/sky390/pi-desktop#readme",
   "license": "Apache-2.0",
   "productName": "Pi Agent Desktop",
   "author": "DLYZZT (Modified by Sky390)",
   "engines": {
-    "node": ">=22.19.0"
+    "node": ">=22.19.0 <23"
+  },
+  "imports": {
+    "#test-bundle": "./scripts/test-bundle.mjs",
+    "#test-timing": "./scripts/test-timing.mjs"
   },
   "main": "out/main/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "node scripts/build.mjs",
-    "build:main": "tsup --config tsup.config.ts",
+    "build:main": "node scripts/build-main.mjs",
     "build:renderer": "vite build",
     "build:smoke": "tsup --config tsup.smoke.config.ts",
     "lint": "eslint src scripts *.ts *.mjs --max-warnings=0",
@@ -30,17 +35,20 @@
     "check:toolchain-catalog:upstream": "node scripts/verify-toolchain-catalog-upstream.mjs",
     "prepare:bundled-tools": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/prepare-bundled-tools.mjs",
     "check:desktop-security": "node scripts/check-desktop-security.mjs",
-    "check:browser-i18n": "node scripts/check-browser-i18n.mjs",
+    "check:i18n": "node scripts/check-renderer-i18n.mjs",
+    "check:browser-i18n": "node scripts/check-renderer-i18n.mjs",
     "check:production-artifacts": "node scripts/check-production-artifacts.mjs",
+    "check:dependencies": "node scripts/check-dependency-contract.mjs",
     "check:packaged-toolchains": "node scripts/verify-packaged-toolchains.mjs",
     "smoke": "node scripts/smoke-electron.mjs",
     "test:browser-electron": "node scripts/test-browser-electron.mjs",
     "test:browser-agent-e2e": "node scripts/test-browser-agent-e2e.mjs",
+    "test:build-watch": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types scripts/test-tsup-watch.mjs",
     "verify": "node scripts/verify.mjs",
     "prepare": "husky",
     "start": "electron .",
-    "pack": "npm run verify && npm run prepare:bundled-tools && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --dir",
-    "dist": "npm run verify && npm run prepare:bundled-tools -- --release && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never",
+    "pack": "node scripts/package-desktop.mjs --dir",
+    "dist": "node scripts/package-desktop.mjs --release",
     "dist:mac:signed": "node scripts/build-mac-release.mjs",
     "dist:mac:notarized": "node scripts/build-mac-release.mjs --notarize"
   },
@@ -67,6 +75,7 @@
     "semver": "7.8.5",
     "silk-wasm": "^3.7.1",
     "tar": "7.5.20",
+    "yaml": "2.9.0",
     "yauzl": "3.4.0"
   },
   "overrides": {
@@ -77,7 +86,7 @@
     "@eslint-community/eslint-plugin-eslint-comments": "^4.7.2",
     "@eslint/js": "^10.0.1",
     "@tailwindcss/postcss": "^4.2.2",
-    "@types/node": "^25",
+    "@types/node": "22.19.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
@@ -86,7 +95,7 @@
     "@vitejs/plugin-react": "^4.7.0",
     "electron": "43.1.1",
     "electron-builder": "26.0.12",
-    "esbuild": "^0.27.7",
+    "esbuild": "0.27.7",
     "eslint": "^10.7.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react-hooks": "^7.1.1",

@@ -5,10 +5,12 @@
 import { app, utilityProcess, MessageChannelMain, type UtilityProcess, type MessagePortMain } from "electron";
 import fs from "fs";
 import path from "path";
-import { appendMainLog } from "./logger";
+import { appendMainLog, appendMainLogs } from "./logger";
 import type { ToolchainSnapshot } from "../shared/toolchains/types";
 import type { BrowserCapabilitySnapshot } from "../contract/browser";
 import { BrowserError } from "./browser/browser-error";
+import { createHostExitSignal, reserveHostRestart, trySpawnHost, type HostExitSignal } from "./host-restart-core";
+import { HostOutputLineBuffer } from "./logger-core";
 
 const CRASH_WINDOW_MS = 30_000;
 const MAX_RESTARTS = 2;
@@ -29,6 +31,7 @@ export type HostMessage =
 
 export class HostManager {
   private child: UtilityProcess | null = null;
+  private childExitSignal: HostExitSignal | null = null;
   private status: HostStatus = "stopped";
   private restartTimes: number[] = [];
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -91,7 +94,8 @@ export class HostManager {
     this.spawn();
   }
 
-  stop(): void {
+  stop(): Promise<void> {
+    const exitPromise = this.childExitSignal?.promise ?? Promise.resolve();
     this.clearPing();
     this.status = "stopped";
     if (this.child) {
@@ -114,6 +118,7 @@ export class HostManager {
         }
       }, 1_500).unref();
     }
+    return exitPromise;
   }
 
   /** Hand a MessagePort to the Host so a renderer can talk to it directly. */
@@ -205,13 +210,25 @@ export class HostManager {
     env.PI_DESKTOP_USER_DATA = app.getPath("userData");
     env.PI_DESKTOP_VERSION = app.getVersion();
 
-    const child = utilityProcess.fork(this.hostEntry, [], {
-      serviceName: "pi-agent-host",
-      stdio: "pipe",
-      env,
-    });
+    const spawnResult = trySpawnHost(() =>
+      utilityProcess.fork(this.hostEntry, [], {
+        serviceName: "pi-agent-host",
+        stdio: "pipe",
+        env,
+      }),
+    );
+    if (!spawnResult.ok) {
+      appendMainLog(`agent-host spawn failed: ${spawnResult.error}`);
+      this.scheduleRestart(`Host failed to spawn: ${spawnResult.error}`);
+      return;
+    }
+    const child = spawnResult.child;
+    const exitSignal = createHostExitSignal();
+    const stdoutBuffer = new HostOutputLineBuffer((lines) => appendMainLogs(lines.map((line) => `[host:out] ${line}`)));
+    const stderrBuffer = new HostOutputLineBuffer((lines) => appendMainLogs(lines.map((line) => `[host:err] ${line}`)));
 
     this.child = child;
+    this.childExitSignal = exitSignal;
     this.lastPong = Date.now();
 
     child.on("spawn", () => {
@@ -294,30 +311,39 @@ export class HostManager {
     child.on("exit", (code) => {
       appendMainLog(`agent-host exit code=${code}`);
       this.clearPing();
-      this.child = null;
+      const wasCurrentChild = this.child === child;
+      if (wasCurrentChild) this.child = null;
+      exitSignal.resolve();
+      if (this.childExitSignal === exitSignal) this.childExitSignal = null;
+      if (!wasCurrentChild) return;
       if (this.status === "stopped") return;
 
       this.wasReadyBeforeExit = this.status === "ready" || this.status === "starting";
-      const now = Date.now();
-      this.restartTimes = this.restartTimes.filter((t) => now - t < CRASH_WINDOW_MS);
-      if (this.restartTimes.length >= MAX_RESTARTS) {
-        this.setStatus("crashed", `Host exited (code ${code}) and restart budget exhausted`);
-        return;
-      }
-      this.restartTimes.push(now);
-      appendMainLog(`restarting agent-host (attempt ${this.restartTimes.length}/${MAX_RESTARTS})`);
-      this.setStatus("starting", `restarting after exit ${code}`);
-      setTimeout(() => this.spawn(), 500);
+      this.scheduleRestart(`Host exited (code ${code})`);
     });
 
-    child.stdout?.on("data", (buf: Buffer) => {
-      const line = buf.toString().trim();
-      if (line) appendMainLog(`[host:out] ${line}`);
-    });
-    child.stderr?.on("data", (buf: Buffer) => {
-      const line = buf.toString().trim();
-      if (line) appendMainLog(`[host:err] ${line}`);
-    });
+    child.stdout?.on("data", (buf: Buffer) => stdoutBuffer.push(buf.toString()));
+    child.stdout?.on("end", () => stdoutBuffer.flush());
+    child.stderr?.on("data", (buf: Buffer) => stderrBuffer.push(buf.toString()));
+    child.stderr?.on("end", () => stderrBuffer.flush());
+  }
+
+  private scheduleRestart(reason: string): void {
+    if (this.status === "stopped") return;
+
+    const reservation = reserveHostRestart(this.restartTimes, Date.now(), CRASH_WINDOW_MS, MAX_RESTARTS);
+    this.restartTimes = reservation.restartTimes;
+    if (reservation.attempt === null) {
+      appendMainLog(`${reason}; restart budget exhausted`);
+      this.setStatus("crashed", `${reason} and restart budget exhausted`);
+      return;
+    }
+
+    appendMainLog(`restarting agent-host (attempt ${reservation.attempt}/${MAX_RESTARTS}): ${reason}`);
+    this.setStatus("starting", `${reason}; restarting`);
+    setTimeout(() => {
+      if (this.status === "starting" && !this.child) this.spawn();
+    }, 500).unref();
   }
 
   private startPing(): void {

@@ -1,37 +1,25 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
+import { createManualScheduler } from "#test-timing";
 
-const output = path.join(
-  import.meta.dirname,
-  "../../../../../.artifacts/test-modules",
-  `telegram-adapter-runtime-${process.pid}.mjs`,
-);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
-  stdin: {
-    contents: [
-      'export { TelegramAdapter, normalizeTelegramUpdate } from "./adapter.ts";',
-      'export { ChannelStateStore } from "../../state-store.ts";',
-    ].join("\n"),
-    resolveDir: import.meta.dirname,
-    sourcefile: "telegram-adapter-runtime-test-entry.ts",
-    loader: "ts",
+const { ChannelStateStore, TelegramAdapter, normalizeTelegramUpdate } = await importTestBundle(
+  "src/agent-host/channels/adapters/telegram/adapter-runtime",
+  {
+    packages: "external",
+    stdin: {
+      contents: [
+        'export { TelegramAdapter, normalizeTelegramUpdate } from "./adapter.ts";',
+        'export { ChannelStateStore } from "../../state-store.ts";',
+      ].join("\n"),
+      resolveDir: import.meta.dirname,
+      sourcefile: "telegram-adapter-runtime-test-entry.ts",
+      loader: "ts",
+    },
   },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
-});
-
-const { ChannelStateStore, TelegramAdapter, normalizeTelegramUpdate } = await import(
-  `${pathToFileURL(output).href}?v=${Date.now()}`
 );
 
 function jsonResponse(value, status = 200) {
@@ -206,6 +194,54 @@ test("runtime checkpoints update offset and suppresses replay after Host restart
   await run(new ChannelStateStore(statePath));
   assert.equal(inboundCount, 1);
   assert.deepEqual(offsets, [undefined, 101, 101]);
+});
+
+test("runtime isolates a failed inbound turn and advances past the poison update", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const controller = new globalThis.AbortController();
+  let updateCalls = 0;
+  globalThis.fetch = async (url) => {
+    const endpoint = String(url);
+    if (endpoint.endsWith("/getMe")) return jsonResponse(botResult());
+    if (endpoint.endsWith("/getUpdates")) {
+      updateCalls += 1;
+      if (updateCalls === 1) {
+        return jsonResponse({ ok: true, result: [dmUpdate(401, "poison"), dmUpdate(402, "still delivered")] });
+      }
+      controller.abort();
+      return jsonResponse({ ok: true, result: [] });
+    }
+    throw new Error(`Unexpected Telegram endpoint: ${endpoint}`);
+  };
+
+  const state = new ChannelStateStore(createStatePath());
+  const inbound = [];
+  const logs = [];
+  await new TelegramAdapter(async () => controller.abort()).start({
+    account: account(),
+    secret: { token: "token", providerAccountId: "42", baseUrl: "https://telegram.example" },
+    signal: controller.signal,
+    state,
+    onInbound: async (envelope) => {
+      inbound.push(envelope.id);
+      if (envelope.id === "401") throw new Error("model rejected Bearer sensitive-token");
+      controller.abort();
+    },
+    onStatus: () => undefined,
+    log: (message) => logs.push(message),
+  });
+
+  assert.deepEqual(inbound, ["401", "402"]);
+  assert.equal(state.isProcessed("telegram-runtime", "401"), true);
+  assert.equal(state.isProcessed("telegram-runtime", "402"), true);
+  assert.equal(state.getCursor("telegram-runtime"), "403");
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /Telegram 入站消息处理失败.*401.*Bearer \[REDACTED\]/);
+  assert.doesNotMatch(logs[0], /sensitive-token/);
 });
 
 test("runtime keeps provider media references private while allowing policy-approved download", async (t) => {
@@ -518,7 +554,8 @@ test("private turns stream Rich drafts and persist folded process details", asyn
       ? jsonResponse({ ok: true, result: { message_id: 81, date: 1, chat: { id: 7, type: "private" } } })
       : jsonResponse({ ok: true, result: true });
   };
-  const adapter = new TelegramAdapter(async () => undefined, 0);
+  const scheduler = createManualScheduler();
+  const adapter = new TelegramAdapter(async () => undefined, 0, scheduler);
   const output = adapter.beginTurn({
     account: account(),
     secret: { token: "token", providerAccountId: "42", baseUrl: "https://telegram.example" },
@@ -545,7 +582,7 @@ test("private turns stream Rich drafts and persist folded process details", asyn
     toolName: "read",
     args: { token: "secret" },
   });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await scheduler.runNext();
   output.update({
     type: "tool_end",
     toolCallId: "tool-one",
@@ -553,7 +590,7 @@ test("private turns stream Rich drafts and persist folded process details", asyn
     result: "读取完成",
     isError: false,
   });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await scheduler.runNext();
   const receipt = await output.finish("## 完成\n\n**最终答案**");
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -639,7 +676,6 @@ test("group turns skip ephemeral drafts and send only a Rich final message", asy
     phase: "update",
     message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
   });
-  await new Promise((resolve) => setTimeout(resolve, 5));
   await output.finish("## 群聊最终回复");
 
   assert.deepEqual(endpoints, ["sendRichMessage"]);
@@ -673,7 +709,8 @@ test("malformed tool progress cannot escape the Telegram draft timer", async (t)
       },
     },
   );
-  const output = new TelegramAdapter(async () => undefined, 0).beginTurn({
+  const scheduler = createManualScheduler();
+  const output = new TelegramAdapter(async () => undefined, 0, scheduler).beginTurn({
     account: account(),
     secret: { token: "token", providerAccountId: "42", baseUrl: "https://telegram.example" },
     peerId: "7",
@@ -686,7 +723,7 @@ test("malformed tool progress cannot escape the Telegram draft timer", async (t)
     toolName: undefined,
     args: hostileValue,
   });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await scheduler.runNext();
   const receipt = await output.finish("最终回复");
 
   const draft = requests.find((request) => request.endpoint === "sendRichMessageDraft");

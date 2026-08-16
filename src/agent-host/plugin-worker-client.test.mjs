@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -82,6 +82,55 @@ test("fails closed when the worker does not return a bounded protocol response",
       (error) => error.code === "TOOLCHAIN_INTERNAL" && /without a result/.test(error.message),
     );
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code !== "ESRCH";
+  }
+}
+
+test("timeout terminates the Plugin worker process tree before rejecting", async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "pi-plugin-worker-tree-"));
+  const pidFile = path.join(directory, "grandchild.pid");
+  const entryPath = path.join(directory, "worker.mjs");
+  let grandchildPid;
+  try {
+    writeFileSync(
+      entryPath,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `const child = spawn(process.execPath, ["-e", ${JSON.stringify("process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)")}], { stdio: "ignore" });`,
+        `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+        'process.on("SIGTERM", () => {});',
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+      "utf8",
+    );
+
+    const pending = runPluginWorker({ body: { action: "update", cwd: directory } }, context(), {
+      entryPath,
+      execPath: process.execPath,
+      timeoutMs: 250,
+      terminationGraceMs: 100,
+    });
+    await assert.rejects(pending, (error) => error.code === "TOOLCHAIN_INTERNAL" && /timed out/.test(error.message));
+    grandchildPid = Number(readFileSync(pidFile, "utf8"));
+    assert.equal(processExists(grandchildPid), false);
+  } finally {
+    if (grandchildPid && processExists(grandchildPid)) {
+      try {
+        process.kill(grandchildPid, "SIGKILL");
+      } catch {
+        /* best-effort test cleanup */
+      }
+    }
     rmSync(directory, { recursive: true, force: true });
   }
 });

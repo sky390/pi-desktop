@@ -12,7 +12,12 @@ import { cacheSessionPath } from "./session-reader";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "../shared/pi-types";
 import type { ChannelId } from "../shared/channel-types";
-import type { ExtensionUiRequest, ExtensionUiResponse, ExtensionWidgetItem } from "../shared/types";
+import type {
+  ChannelMessageAttachment,
+  ExtensionUiRequest,
+  ExtensionUiResponse,
+  ExtensionWidgetItem,
+} from "../shared/types";
 import { toolchainRuntime } from "./toolchain-runtime";
 import { createToolchainBashOptions } from "./toolchain-bash";
 import { createDesktopSearchToolDefinitions } from "./toolchain-search";
@@ -25,6 +30,7 @@ import {
 import { browserCapabilityRuntime } from "./browser-capability-runtime";
 import { browserAgentRuntime } from "./browser-agent-runtime";
 import { projectExtensionDiagnostics } from "./extension-diagnostics";
+import { getDesktopSessionToolNames, setDesktopSessionToolNames } from "./session-tool-store";
 
 // ============================================================================
 // Types
@@ -105,8 +111,38 @@ type ExtensionBindingOptions = {
 export type ExternalSessionCommand = "compact" | "reload";
 
 const CODING_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+const SESSION_TOOLS_ENTRY = "pi-desktop-session-tools";
 const LEGACY_CHANNEL_PROMPT = /^\[外部消息来源：(微信|Telegram|飞书 \/ Lark)\]\n/;
 const LEGACY_CHANNEL_PROMPT_DELIMITER = "\n---\n";
+
+type PersistedSessionTools = {
+  version: 1;
+  toolNames: string[];
+};
+
+function parsePersistedSessionTools(value: unknown): string[] | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const state = value as Partial<PersistedSessionTools>;
+  if (
+    state.version !== 1 ||
+    !Array.isArray(state.toolNames) ||
+    !state.toolNames.every((name) => typeof name === "string")
+  ) {
+    return undefined;
+  }
+  return [...new Set(state.toolNames.map((name) => name.trim()).filter(Boolean))];
+}
+
+export function getLegacySessionToolNames(sessionManager: Pick<SessionManager, "getEntries">): string[] | undefined {
+  const entries = sessionManager.getEntries();
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.type !== "custom" || entry.customType !== SESSION_TOOLS_ENTRY) continue;
+    const toolNames = parsePersistedSessionTools(entry.data);
+    if (toolNames !== undefined) return toolNames;
+  }
+  return undefined;
+}
 
 function stripLegacyChannelPromptText(text: string): string {
   if (!LEGACY_CHANNEL_PROMPT.test(text)) return text;
@@ -175,21 +211,34 @@ export class AgentSessionWrapper {
   private turnTail: Promise<void> = Promise.resolve();
   private externalTurnActive = false;
   private externalTurnChannel: ChannelId | null = null;
+  private externalTurnAttachments: ChannelMessageAttachment[] | null = null;
   private externalTurnProgress: ((event: AgentEvent) => void) | null = null;
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
+  private extensionBindingAttempt = 0;
   private forceEmptySystemPrompt = false;
   private toolchainPrompt = "";
   private unsubscribe: (() => void) | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
-  private onDestroyCallback: (() => void) | null = null;
+  private destroyCallbacks = new Set<() => void>();
+  private disposePromise: Promise<void> | null = null;
   private _alive = true;
+  private requestedToolNames: string[] | undefined;
+  private readonly persistToolNames: (sessionId: string, toolNames: string[]) => void;
 
-  constructor(inner: AgentSessionLike) {
+  constructor(
+    inner: AgentSessionLike,
+    requestedToolNames?: string[],
+    persistToolNames: (sessionId: string, toolNames: string[]) => void = setDesktopSessionToolNames,
+  ) {
     this.inner = inner;
+    this.persistToolNames = persistToolNames;
+    this.requestedToolNames = requestedToolNames ? [...requestedToolNames] : requestedToolNames;
+    this.forceEmptySystemPrompt = requestedToolNames?.length === 0;
     const messages = this.inner.agent.state?.messages;
     if (Array.isArray(messages)) this.inner.agent.state!.messages = stripLegacyChannelPrompts(messages);
+    this.applyForcedEmptySystemPrompt();
   }
 
   get sessionId(): string {
@@ -235,6 +284,10 @@ export class AgentSessionWrapper {
   }
 
   syncBrowserToolActivation(): void {
+    if (this.forceEmptySystemPrompt) {
+      this.inner.setActiveToolsByName([]);
+      return;
+    }
     const current = this.inner.getActiveToolNames().filter((name) => !isBrowserToolName(name));
     const browserTools = browserToolNamesForSnapshot(browserCapabilityRuntime.getSnapshot());
     this.inner.setActiveToolsByName([...new Set([...current, ...browserTools])]);
@@ -246,13 +299,12 @@ export class AgentSessionWrapper {
     if (!message || typeof message !== "object" || (message as { role?: unknown }).role !== "user") return event;
     return {
       ...event,
-      message: { ...(message as Record<string, unknown>), channelSource: this.externalTurnChannel },
+      message: {
+        ...(message as Record<string, unknown>),
+        channelSource: this.externalTurnChannel,
+        ...(this.externalTurnAttachments?.length ? { channelAttachments: this.externalTurnAttachments } : {}),
+      },
     };
-  }
-
-  setForceEmptySystemPrompt(force: boolean): void {
-    this.forceEmptySystemPrompt = force;
-    this.applyForcedEmptySystemPrompt();
   }
 
   setToolchainSummary(revision: number, summary: readonly string[]): void {
@@ -328,7 +380,9 @@ export class AgentSessionWrapper {
     if (this.extensionBindingPromise) return this.extensionBindingPromise;
 
     this.extensionBindingError = null;
-    this.extensionBindingPromise = (async () => {
+    const attempt = ++this.extensionBindingAttempt;
+    const startedAt = Date.now();
+    const bindingPromise: Promise<void> = (async () => {
       if (!this._alive) return;
       const uiContext = this.createExtensionUiContext();
       if (typeof this.inner.bindExtensions === "function") {
@@ -365,17 +419,25 @@ export class AgentSessionWrapper {
       this.extensionsBound = true;
       this.applyForcedEmptySystemPrompt();
       console.log(`[pi-desktop] session_start dispatched to extensions for session ${this.inner.sessionId}`);
-    })().catch((err) => {
-      this.extensionBindingError = err;
-      throw err;
-    });
+    })()
+      .catch((err) => {
+        this.extensionBindingError = err;
+        console.warn(
+          `[pi-desktop] extension binding attempt ${attempt} failed after ${Date.now() - startedAt}ms for session ${this.inner.sessionId}`,
+        );
+        throw err;
+      })
+      .finally(() => {
+        if (this.extensionBindingPromise === bindingPromise) this.extensionBindingPromise = null;
+      });
+    this.extensionBindingPromise = bindingPromise;
 
-    return this.extensionBindingPromise;
+    return bindingPromise;
   }
 
   private async waitForExtensionsBound(): Promise<void> {
     try {
-      if (this.extensionBindingPromise) await this.extensionBindingPromise;
+      if (!this.extensionsBound) await this.ensureExtensionsBound();
     } catch (err) {
       throw err instanceof Error ? err : new Error(String(err));
     }
@@ -402,6 +464,14 @@ export class AgentSessionWrapper {
     if (this.forceEmptySystemPrompt && this.inner.agent.state) {
       this.inner.agent.state.systemPrompt = "";
     }
+  }
+
+  private applyRequestedTools(toolNames: string[]): void {
+    this.requestedToolNames = [...toolNames];
+    this.forceEmptySystemPrompt = toolNames.length === 0;
+    this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
+    this.syncBrowserToolActivation();
+    this.applyForcedEmptySystemPrompt();
   }
 
   private applyToolchainSummary(): void {
@@ -446,6 +516,7 @@ export class AgentSessionWrapper {
     message: string;
     channel: ChannelId;
     images?: Array<{ type: "image"; data: string; mimeType: string }>;
+    channelAttachments?: ChannelMessageAttachment[];
     attachmentContext?: string;
     onProgress?: (event: AgentEvent) => void;
   }): Promise<{ runId: string; finalText: string }> {
@@ -453,6 +524,7 @@ export class AgentSessionWrapper {
       this.emit({ type: "channel_turn_start", runId: params.runId });
       this.externalTurnActive = true;
       this.externalTurnChannel = params.channel;
+      this.externalTurnAttachments = params.channelAttachments ?? null;
       setBrowserSessionSource(this.inner.sessionManager, "channel");
       browserAgentRuntime.beginTurn(this.sessionId, "channel");
       this.externalTurnProgress = params.onProgress ?? null;
@@ -460,6 +532,7 @@ export class AgentSessionWrapper {
         this.inner.sessionManager.appendCustomEntry("pi-desktop-channel-source", {
           runId: params.runId,
           channel: params.channel,
+          ...(params.channelAttachments?.length ? { attachments: params.channelAttachments } : {}),
         });
         if (params.attachmentContext) {
           await this.inner.sendCustomMessage(
@@ -495,19 +568,28 @@ export class AgentSessionWrapper {
         this.externalTurnProgress = null;
         this.externalTurnActive = false;
         this.externalTurnChannel = null;
+        this.externalTurnAttachments = null;
         setBrowserSessionSource(this.inner.sessionManager, "local");
       }
     });
   }
 
   private async reloadSessionResources(): Promise<void> {
-    await this.waitForExtensionsBound();
+    if (this.extensionBindingPromise) {
+      try {
+        await this.extensionBindingPromise;
+      } catch {
+        // Reload is the explicit recovery path for a failed extension bind.
+      }
+    }
+    this.extensionsBound = false;
+    this.extensionBindingPromise = null;
+    this.extensionBindingError = null;
     this.extensionStatuses.clear();
     this.disposeAllWidgets();
     await this.inner.reload();
-    if (typeof this.inner.bindExtensions !== "function") {
-      this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
-    }
+    await this.ensureExtensionsBound();
+    if (this.requestedToolNames !== undefined) this.applyRequestedTools(this.requestedToolNames);
     this.applyForcedEmptySystemPrompt();
     this.applyToolchainSummary();
   }
@@ -531,7 +613,7 @@ export class AgentSessionWrapper {
           this.resetIdleTimer();
           return;
         }
-        this.destroy();
+        void this.dispose({ abort: true, reason: "idle-eviction" });
       },
       10 * 60 * 1000,
     );
@@ -546,8 +628,13 @@ export class AgentSessionWrapper {
     };
   }
 
-  onDestroy(cb: () => void): void {
-    this.onDestroyCallback = cb;
+  onDestroy(cb: () => void): () => void {
+    if (!this._alive) {
+      cb();
+      return () => undefined;
+    }
+    this.destroyCallbacks.add(cb);
+    return () => this.destroyCallbacks.delete(cb);
   }
 
   async send(command: Record<string, unknown>): Promise<unknown> {
@@ -651,7 +738,7 @@ export class AgentSessionWrapper {
 
         const newSessionId = SessionManager.open(newSessionFile, sessionDir).getSessionId();
         cacheSessionPath(newSessionId, newSessionFile);
-        this.destroy();
+        await this.dispose({ abort: true, reason: "fork" });
         return { cancelled: false, newSessionId };
       }
 
@@ -766,10 +853,8 @@ export class AgentSessionWrapper {
 
       case "set_tools": {
         const toolNames = command.toolNames as string[];
-        this.setForceEmptySystemPrompt(toolNames.length === 0);
-        this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
-        this.syncBrowserToolActivation();
-        this.applyForcedEmptySystemPrompt();
+        this.applyRequestedTools(toolNames);
+        this.persistToolNames(this.sessionId, toolNames);
         return null;
       }
 
@@ -805,24 +890,64 @@ export class AgentSessionWrapper {
   }
 
   /**
-   * Stop the underlying agent and release resources (ISSUE-001).
-   * Prefer dispose() for full teardown after abort.
+   * Stop the underlying agent and release resources. Calls are idempotent and
+   * concurrent owners share one teardown attempt.
    */
-  async abortAndDispose(): Promise<void> {
-    if (!this._alive) return;
-    try {
-      await this.inner.abort();
-    } catch {
-      /* already stopped */
-    }
-    try {
-      const agent = this.inner.agent as { waitForIdle?: () => Promise<void>; dispose?: () => void | Promise<void> };
-      await agent.waitForIdle?.();
-      await agent.dispose?.();
-    } catch {
-      /* best-effort */
-    }
+  dispose(options: { abort?: boolean; reason?: string; timeoutMs?: number } = {}): Promise<void> {
+    if (this.disposePromise) return this.disposePromise;
+    const abort = options.abort !== false;
+    const reason = options.reason ?? "explicit";
+    const timeoutMs = options.timeoutMs ?? 5_000;
     this.destroy();
+
+    this.disposePromise = (async () => {
+      const teardown = async () => {
+        if (abort) {
+          try {
+            await this.inner.abort();
+          } catch (error) {
+            console.warn(
+              `[pi-desktop] session abort failed during ${reason} for ${this.sessionId}: ${error instanceof Error ? error.name : "UnknownError"}`,
+            );
+          }
+        }
+        const agent = this.inner.agent as { waitForIdle?: () => Promise<void>; dispose?: () => void | Promise<void> };
+        try {
+          await agent.waitForIdle?.();
+        } catch (error) {
+          console.warn(
+            `[pi-desktop] session waitForIdle failed during ${reason} for ${this.sessionId}: ${error instanceof Error ? error.name : "UnknownError"}`,
+          );
+        }
+        try {
+          await agent.dispose?.();
+        } catch (error) {
+          console.warn(
+            `[pi-desktop] session dispose failed during ${reason} for ${this.sessionId}: ${error instanceof Error ? error.name : "UnknownError"}`,
+          );
+        }
+      };
+
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          teardown(),
+          new Promise<void>((resolve) => {
+            timeout = setTimeout(() => {
+              console.warn(`[pi-desktop] session teardown timed out after ${timeoutMs}ms during ${reason}`);
+              resolve();
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    })();
+    return this.disposePromise;
+  }
+
+  async abortAndDispose(): Promise<void> {
+    await this.dispose({ abort: true, reason: "explicit" });
   }
 
   destroy(): void {
@@ -847,7 +972,15 @@ export class AgentSessionWrapper {
     this.pendingUiResponses.clear();
     this.pendingUiRequests.clear();
     this.listeners = [];
-    this.onDestroyCallback?.();
+    const destroyCallbacks = [...this.destroyCallbacks];
+    this.destroyCallbacks.clear();
+    for (const callback of destroyCallbacks) {
+      try {
+        callback();
+      } catch {
+        /* isolate teardown owners */
+      }
+    }
     notifyRunningChange();
   }
 
@@ -1436,6 +1569,10 @@ export async function activateSession(sessionId: string): Promise<void> {
   activeSessionPointer = sessionId;
 }
 
+export async function disposeAllRpcSessions(reason = "host-shutdown"): Promise<void> {
+  await Promise.all([...getRegistry().values()].map((session) => session.dispose({ abort: true, reason })));
+}
+
 export function syncBrowserToolsForAllSessions(): void {
   for (const session of getRegistry().values()) session.syncBrowserToolActivation();
 }
@@ -1542,19 +1679,13 @@ export async function startRpcSession(
       ? SessionManager.open(sessionFile, undefined)
       : SessionManager.create(cwd, undefined);
 
-    // Determine which tools to pass based on requested toolNames.
-    // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
-    let toolsOption: string[] | undefined;
-    if (toolNames !== undefined) {
-      // toolNames === [] -> "all off" (an empty allow-list disables every tool).
-      // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
-      // set allowedToolNames to coding builtins only, which filtered every
-      // extension/package-provided tool (e.g. subagents, web access) out of the
-      // tool registry — so they were unavailable in desktop sessions even though the
-      // `pi` CLI keeps them. Leaving the allow-list unset lets the SDK register all
-      // tools (and activate extension tools); we narrow the ACTIVE set below.
-      toolsOption = toolNames.length === 0 ? [] : undefined;
-    }
+    // Desktop-owned session choices live outside Pi's shared JSONL so the CLI
+    // remains unaffected. Read the old custom entry only for one-way migration.
+    const managerSessionId = sessionManager.getSessionId();
+    const desktopToolNames = getDesktopSessionToolNames(managerSessionId);
+    const legacyToolNames = desktopToolNames === undefined ? getLegacySessionToolNames(sessionManager) : undefined;
+    const persistedToolNames = desktopToolNames ?? legacyToolNames;
+    const sessionToolNames = persistedToolNames ?? toolNames;
 
     // Build services first so extension-registered providers are available
     // before the SDK restores the saved model from the session file.
@@ -1578,30 +1709,23 @@ export async function startRpcSession(
     const { session: inner } = await createAgentSessionFromServices({
       services,
       sessionManager,
-      ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
       customTools,
     });
+    const realSessionId = inner.sessionId as string;
 
-    // If specific tool names were requested (non-empty), set the active tools to the
-    // requested builtin coding tools PLUS all extension/package tools, so installed
-    // extensions stay usable in Pi Desktop just like in the `pi` CLI.
-    if (toolNames && toolNames.length > 0) {
-      inner.setActiveToolsByName(withExtensionTools(inner, toolNames));
+    // Keep every tool registered so a session initialized with no tools can enable
+    // them later. Narrow only the active set, never the registry allow-list.
+    if (sessionToolNames !== undefined) {
+      inner.setActiveToolsByName(withExtensionTools(inner, sessionToolNames));
+      if (desktopToolNames === undefined) setDesktopSessionToolNames(realSessionId, sessionToolNames);
     }
 
-    const wrapper = new AgentSessionWrapper(inner);
+    const wrapper = new AgentSessionWrapper(inner, sessionToolNames);
     wrapper.setRuntimeDiagnostics(services.diagnostics);
     wrapper.setToolchainSummary(executionContext.inventoryRevision, executionContext.summary);
-    // When all tools are disabled, clear the system prompt entirely.
-    // pi's buildSystemPrompt always produces a non-empty prompt even with no tools;
-    // keep this forced after extension resource discovery and reloads as well.
-    if (toolNames?.length === 0) {
-      wrapper.setForceEmptySystemPrompt(true);
-    }
     wrapper.start();
     wrapper.syncBrowserToolActivation();
 
-    const realSessionId = inner.sessionId as string;
     const realSessionFile = inner.sessionFile as string | undefined;
     if (realSessionFile) cacheSessionPath(realSessionId, realSessionFile);
 
@@ -1610,7 +1734,7 @@ export async function startRpcSession(
       if (activeSessionPointer === realSessionId) activeSessionPointer = null;
     });
     registry.set(realSessionId, wrapper);
-    wrapper.beginExtensionBinding({ forceEmptySystemPrompt: toolNames?.length === 0 });
+    wrapper.beginExtensionBinding({ forceEmptySystemPrompt: sessionToolNames?.length === 0 });
     if (activate) activeSessionPointer = realSessionId;
 
     return { session: wrapper, realSessionId };

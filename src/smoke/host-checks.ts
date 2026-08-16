@@ -135,67 +135,80 @@ export async function runSmokeHostChecks(
     const os = await import("os");
     const { execFileSync } = await import("child_process");
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pi-desktop-smoke-"));
-    // Cleanup of the workspace (and its "-worktrees" sibling) happens in
-    // scripts/smoke-electron.mjs after Electron exits: on Windows the app
-    // holds these dirs (EPERM) until the process is gone.
-    execFileSync("git", ["init", "-q", repo]);
-    fs.writeFileSync(path.join(repo, "README.md"), "smoke\n");
-    execFileSync("git", ["-C", repo, "add", "README.md"]);
-    execFileSync("git", [
-      "-C",
-      repo,
-      "-c",
-      "user.name=Pi Desktop",
-      "-c",
-      "user.email=smoke@example.invalid",
-      "commit",
-      "-qm",
-      "initial",
-    ]);
-    await call("system.allowRoot", { path: repo });
-    const skillDir = path.join(repo, ".pi", "skills", "smoke-skill");
-    const skillPath = path.join(skillDir, "SKILL.md");
-    fs.mkdirSync(skillDir, { recursive: true });
-    fs.writeFileSync(skillPath, "---\nname: smoke-skill\ndescription: smoke\n---\n\nOriginal body.\n");
-    const skills = await call<{ skills?: Array<{ name?: string; filePath?: string }> }>("skills.list", { cwd: repo });
-    const smokeSkill = skills.skills?.find((skill) => skill.name === "smoke-skill");
-    if (!smokeSkill?.filePath) throw new Error("skills.list did not load the project smoke skill");
-    const updatedSkill = "---\nname: smoke-skill\ndescription: edited smoke\n---\n\nEdited body.\n";
-    await call("skills.set", { cwd: repo, filePath: smokeSkill.filePath, content: updatedSkill });
-    const skillContent = await call<{ content?: string }>("skills.getContent", {
-      cwd: repo,
-      filePath: smokeSkill.filePath,
-    });
-    if (skillContent.content !== updatedSkill) throw new Error("skills.set did not persist exact content");
-    await call("files.watchStart", { path: repo });
-    const changeEvent = waitForEvent(
-      "files.changed",
-      repo,
-      (data) => (data as { event?: string } | null)?.event === "change",
-    );
-    // A ping on the same port is a barrier ensuring the subscription was processed.
-    await call("host.ping");
-    fs.writeFileSync(path.join(repo, "watch-change.txt"), "changed\n");
-    await changeEvent;
-    await call("files.watchStop", { path: repo });
-    const repoStatus = await call<{ isGit?: boolean; untracked?: number }>("git.status", { path: repo });
-    if (!repoStatus.isGit || !repoStatus.untracked) throw new Error("git.status did not report project changes");
-    const created = await call<{ worktree?: { path?: string } }>("worktrees.create", {
-      projectRoot: repo,
-      cwd: repo,
-      branch: "smoke-worktree",
-    });
-    const worktreePath = created.worktree?.path;
-    if (!worktreePath || !fs.existsSync(worktreePath)) throw new Error("worktrees.create returned an invalid path");
-    fs.writeFileSync(path.join(worktreePath, "dirty.txt"), "dirty\n");
-    let dirtyConflict = false;
+    const worktreeParent = `${repo}-worktrees`;
     try {
-      await call("worktrees.remove", { cwd: repo, path: worktreePath, force: false });
-    } catch (error) {
-      dirtyConflict = (error as { detail?: { dirty?: boolean } }).detail?.dirty === true;
+      execFileSync("git", ["init", "-q", repo]);
+      fs.writeFileSync(path.join(repo, "README.md"), "smoke\n");
+      execFileSync("git", ["-C", repo, "add", "README.md"]);
+      execFileSync("git", [
+        "-C",
+        repo,
+        "-c",
+        "user.name=Pi Desktop",
+        "-c",
+        "user.email=smoke@example.invalid",
+        "commit",
+        "-qm",
+        "initial",
+      ]);
+      await call("system.allowRoot", { path: repo });
+      const skillDir = path.join(repo, ".pi", "skills", "smoke-skill");
+      const skillPath = path.join(skillDir, "SKILL.md");
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(skillPath, "---\nname: smoke-skill\ndescription: smoke\n---\n\nOriginal body.\n");
+      const skills = await call<{ skills?: Array<{ name?: string; filePath?: string }> }>("skills.list", { cwd: repo });
+      const smokeSkill = skills.skills?.find((skill) => skill.name === "smoke-skill");
+      if (!smokeSkill?.filePath) throw new Error("skills.list did not load the project smoke skill");
+      const updatedSkill = "---\nname: smoke-skill\ndescription: edited smoke\n---\n\nEdited body.\n";
+      await call("skills.set", { cwd: repo, filePath: smokeSkill.filePath, content: updatedSkill });
+      const skillContent = await call<{ content?: string }>("skills.getContent", {
+        cwd: repo,
+        filePath: smokeSkill.filePath,
+      });
+      if (skillContent.content !== updatedSkill) throw new Error("skills.set did not persist exact content");
+      await call("files.watchStart", { path: repo });
+      const changeEvent = waitForEvent(
+        "files.changed",
+        repo,
+        (data) => (data as { event?: string } | null)?.event === "change",
+      );
+      // A ping on the same port is a barrier ensuring the subscription was processed.
+      await call("host.ping");
+      fs.writeFileSync(path.join(repo, "watch-change.txt"), "changed\n");
+      await changeEvent;
+      await call("files.watchStop", { path: repo });
+      const repoStatus = await call<{ isGit?: boolean; untracked?: number }>("git.status", { path: repo });
+      if (!repoStatus.isGit || !repoStatus.untracked) throw new Error("git.status did not report project changes");
+      const created = await call<{ worktree?: { path?: string } }>("worktrees.create", {
+        projectRoot: repo,
+        cwd: repo,
+        branch: "smoke-worktree",
+      });
+      const worktreePath = created.worktree?.path;
+      if (!worktreePath || !fs.existsSync(worktreePath)) throw new Error("worktrees.create returned an invalid path");
+      fs.writeFileSync(path.join(worktreePath, "dirty.txt"), "dirty\n");
+      let dirtyConflict = false;
+      try {
+        await call("worktrees.remove", { cwd: repo, path: worktreePath, force: false });
+      } catch (error) {
+        dirtyConflict = (error as { detail?: { dirty?: boolean } }).detail?.dirty === true;
+      }
+      if (!dirtyConflict) throw new Error("dirty worktree removal did not return structured conflict detail");
+      await call("worktrees.remove", { cwd: repo, path: worktreePath, force: true });
+    } finally {
+      const cleanupOptions = { recursive: true, force: true, maxRetries: 10, retryDelay: 200 } as const;
+      for (const directory of [repo, worktreeParent]) {
+        try {
+          fs.rmSync(directory, cleanupOptions);
+        } catch (error) {
+          // Antivirus and git processes can briefly retain handles on Windows.
+          // The smoke assertions have already completed, and the OS owns these
+          // temporary directories, so a deferred cleanup must not mask them.
+          appendMainLog(`smoke: temporary cleanup deferred: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
     }
-    if (!dirtyConflict) throw new Error("dirty worktree removal did not return structured conflict detail");
-    await call("worktrees.remove", { cwd: repo, path: worktreePath, force: true });
+
     const smokeWindow = createWindow((message) => {
       if (/Content Security Policy/i.test(message)) rendererSecurityViolation = message;
     });

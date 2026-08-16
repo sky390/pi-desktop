@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect, useMemo } from "react";
+import { memo, useState, useRef, useEffect, useMemo } from "react";
 import { MarkdownBody } from "./MarkdownBody";
-import { copyText } from "@/lib/clipboard";
+import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { parseCompactionSummary } from "@/lib/compaction-summary";
 import {
   getAssistantFailureDetail,
@@ -8,9 +8,10 @@ import {
   isAssistantFailure,
   isEmptyThinkingBlock,
 } from "@/lib/message-display";
-import { getUserBubbleColor } from "@/lib/channel-message-style";
-import { CHANNEL_ATTACHMENT_PROMPT_PLACEHOLDER } from "@shared/channel-message";
+import { getUserBubbleStyle } from "@/lib/channel-message-style";
+import { CHANNEL_ATTACHMENT_PROMPT_PLACEHOLDER, channelAttachmentCopyText } from "@shared/channel-message";
 import { useI18n } from "@/i18n";
+import { useTheme } from "@/hooks/useTheme";
 import { parseUnifiedPatch, type SplitDiffCell } from "@/lib/patch";
 import type {
   AgentMessage,
@@ -28,7 +29,8 @@ import type {
 interface Props {
   message: AgentMessage;
   isStreaming?: boolean;
-  toolResults?: Map<string, ToolResultMessage>;
+  toolResults?: ReadonlyMap<string, ToolResultMessage>;
+  toolCallDurations?: ReadonlyMap<string, number>;
   modelNames?: Record<string, string>;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
@@ -117,10 +119,11 @@ function DeferredContentActions({
   );
 }
 
-export function MessageView({
+export const MessageView = memo(function MessageView({
   message,
   isStreaming,
   toolResults,
+  toolCallDurations,
   modelNames,
   cwd,
   onOpenFile,
@@ -156,6 +159,7 @@ export function MessageView({
         message={message as AssistantMessage}
         isStreaming={isStreaming}
         toolResults={toolResults}
+        toolCallDurations={toolCallDurations}
         modelNames={modelNames}
         cwd={cwd}
         onOpenFile={onOpenFile}
@@ -188,7 +192,7 @@ export function MessageView({
     );
   }
   return null;
-}
+});
 
 function UserMessageView({
   message,
@@ -214,8 +218,9 @@ function UserMessageView({
   onLoadDeferredContent?: (entryId: string, blockIndex?: number) => Promise<void>;
 }) {
   const { t } = useI18n();
+  const { isDark } = useTheme();
   const [hovered, setHovered] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
 
   const content =
     typeof message.content === "string"
@@ -230,24 +235,24 @@ function UserMessageView({
       ? []
       : message.content.filter((b): b is ImageContent => b.type === "image" && !b.deferredContent);
 
-  const visibleContent =
-    message.channelSource && content === CHANNEL_ATTACHMENT_PROMPT_PLACEHOLDER
-      ? imageBlocks.length > 0
-        ? ""
-        : t("channelAttachment", "Attachment")
-      : content;
+  const isChannelAttachmentPlaceholder = !!message.channelSource && content === CHANNEL_ATTACHMENT_PROMPT_PLACEHOLDER;
+  const attachmentCopyContent = isChannelAttachmentPlaceholder
+    ? channelAttachmentCopyText(message.channelAttachments, imageBlocks)
+    : "";
+  const visibleContent = isChannelAttachmentPlaceholder
+    ? imageBlocks.length > 0
+      ? ""
+      : attachmentCopyContent || t("channelAttachment", "Attachment")
+    : content;
+  const copyableContent = isChannelAttachmentPlaceholder ? attachmentCopyContent : visibleContent;
 
   const time = formatTime(message.timestamp);
   const messageSource = message.channelSource ?? "local";
+  const bubbleStyle = getUserBubbleStyle(message.channelSource, isDark);
   const canFork = !!entryId && !!onFork;
   const canNavigate = !!prevAssistantEntryId && !!onNavigate;
 
-  const copyContent = () => {
-    void copyText(visibleContent).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
+  const copyContent = () => void copy(copyableContent);
 
   return (
     <div
@@ -270,12 +275,12 @@ function UserMessageView({
           style={{
             minWidth: 0,
             maxWidth: "100%",
-            background: getUserBubbleColor(message.channelSource),
+            background: bubbleStyle.background,
             borderRadius: "10px 10px 2px 10px",
             padding: "9px 13px",
             fontSize: 13.5,
             lineHeight: 1.55,
-            color: "var(--user-fg)",
+            color: bubbleStyle.foreground,
             wordBreak: "break-word",
           }}
         >
@@ -320,54 +325,127 @@ function UserMessageView({
       </div>
 
       {/* Bottom row: action buttons + timestamp */}
-      {(time || canFork || canNavigate || true) && (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "flex-end",
+          gap: 6,
+          marginTop: 3,
+        }}
+      >
         <div
+          className="message-hover-actions"
           style={{
             display: "flex",
-            alignItems: "center",
-            justifyContent: "flex-end",
-            gap: 6,
-            marginTop: 3,
+            gap: 3,
+            opacity: hovered ? 1 : 0,
+            pointerEvents: hovered ? "auto" : "none",
+            transition: "opacity 0.12s",
           }}
         >
+          <button
+            type="button"
+            onClick={copyContent}
+            disabled={!copyableContent}
+            title={copyableContent ? "Copy message" : "Nothing to copy"}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              padding: "3px 8px",
+              height: 32,
+              background: "none",
+              border: "none",
+              borderRadius: 5,
+              color: copied ? "var(--accent)" : "var(--text-dim)",
+              cursor: copyableContent ? "pointer" : "not-allowed",
+              opacity: copyableContent ? 1 : 0.55,
+              fontSize: 12,
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              transition: "color 0.12s",
+            }}
+            onMouseEnter={(e) => {
+              if (!copied) e.currentTarget.style.color = "var(--accent)";
+            }}
+            onMouseLeave={(e) => {
+              if (!copied) e.currentTarget.style.color = "var(--text-dim)";
+            }}
+          >
+            {copied ? (
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            ) : (
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+              </svg>
+            )}
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+        {(canFork || canNavigate) && (
           <div
             className="message-hover-actions"
             style={{
               display: "flex",
               gap: 3,
-              opacity: hovered ? 1 : 0,
-              pointerEvents: hovered ? "auto" : "none",
+              opacity: hovered || forking ? 1 : 0,
+              pointerEvents: hovered || forking ? "auto" : "none",
               transition: "opacity 0.12s",
             }}
           >
-            <button
-              type="button"
-              onClick={copyContent}
-              title="Copy message"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 4,
-                padding: "3px 8px",
-                height: 32,
-                background: "none",
-                border: "none",
-                borderRadius: 5,
-                color: copied ? "var(--accent)" : "var(--text-dim)",
-                cursor: "pointer",
-                fontSize: 12,
-                fontWeight: 400,
-                whiteSpace: "nowrap",
-                transition: "color 0.12s",
-              }}
-              onMouseEnter={(e) => {
-                if (!copied) e.currentTarget.style.color = "var(--accent)";
-              }}
-              onMouseLeave={(e) => {
-                if (!copied) e.currentTarget.style.color = "var(--text-dim)";
-              }}
-            >
-              {copied ? (
+            {canNavigate && (
+              <button
+                type="button"
+                onClick={() => {
+                  onNavigate!(prevAssistantEntryId!);
+                  onEditContent?.(content);
+                }}
+                title="Edit from here — branches within this session"
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  padding: "3px 8px",
+                  height: 32,
+                  background: "none",
+                  border: "none",
+                  borderRadius: 5,
+                  color: "var(--text-dim)",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 400,
+                  whiteSpace: "nowrap",
+                  transition: "color 0.12s",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.color = "var(--accent)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.color = "var(--text-dim)";
+                }}
+              >
                 <svg
                   width="11"
                   height="11"
@@ -378,9 +456,43 @@ function UserMessageView({
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 >
-                  <polyline points="20 6 9 17 4 12" />
+                  <polyline points="15 10 20 15 15 20" />
+                  <path d="M4 4v7a4 4 0 0 0 4 4h12" />
                 </svg>
-              ) : (
+                Edit from here
+              </button>
+            )}
+            {canFork && (
+              <button
+                type="button"
+                onClick={() => {
+                  onFork!(entryId!);
+                }}
+                disabled={forking}
+                title={forking ? "Creating new session…" : "New session — creates an independent copy from here"}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 4,
+                  padding: "3px 8px",
+                  height: 32,
+                  background: "none",
+                  border: "none",
+                  borderRadius: 5,
+                  color: forking ? "var(--accent)" : "var(--text-dim)",
+                  cursor: forking ? "not-allowed" : "pointer",
+                  fontSize: 12,
+                  fontWeight: 400,
+                  whiteSpace: "nowrap",
+                  transition: "color 0.12s",
+                }}
+                onMouseEnter={(e) => {
+                  if (!forking) e.currentTarget.style.color = "var(--accent)";
+                }}
+                onMouseLeave={(e) => {
+                  if (!forking) e.currentTarget.style.color = "var(--text-dim)";
+                }}
+              >
                 <svg
                   width="11"
                   height="11"
@@ -391,125 +503,18 @@ function UserMessageView({
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 >
-                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  <line x1="6" y1="3" x2="6" y2="15" />
+                  <circle cx="18" cy="6" r="3" />
+                  <circle cx="6" cy="18" r="3" />
+                  <path d="M18 9a9 9 0 0 1-9 9" />
                 </svg>
-              )}
-              {copied ? "Copied" : "Copy"}
-            </button>
+                {forking ? "Creating…" : "New session"}
+              </button>
+            )}
           </div>
-          {(canFork || canNavigate) && (
-            <div
-              className="message-hover-actions"
-              style={{
-                display: "flex",
-                gap: 3,
-                opacity: hovered || forking ? 1 : 0,
-                pointerEvents: hovered || forking ? "auto" : "none",
-                transition: "opacity 0.12s",
-              }}
-            >
-              {canNavigate && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onNavigate!(prevAssistantEntryId!);
-                    onEditContent?.(content);
-                  }}
-                  title="Edit from here — branches within this session"
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                    padding: "3px 8px",
-                    height: 32,
-                    background: "none",
-                    border: "none",
-                    borderRadius: 5,
-                    color: "var(--text-dim)",
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 400,
-                    whiteSpace: "nowrap",
-                    transition: "color 0.12s",
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.color = "var(--accent)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.color = "var(--text-dim)";
-                  }}
-                >
-                  <svg
-                    width="11"
-                    height="11"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <polyline points="15 10 20 15 15 20" />
-                    <path d="M4 4v7a4 4 0 0 0 4 4h12" />
-                  </svg>
-                  Edit from here
-                </button>
-              )}
-              {canFork && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    onFork!(entryId!);
-                  }}
-                  disabled={forking}
-                  title={forking ? "Creating new session…" : "New session — creates an independent copy from here"}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 4,
-                    padding: "3px 8px",
-                    height: 32,
-                    background: "none",
-                    border: "none",
-                    borderRadius: 5,
-                    color: forking ? "var(--accent)" : "var(--text-dim)",
-                    cursor: forking ? "not-allowed" : "pointer",
-                    fontSize: 12,
-                    fontWeight: 400,
-                    whiteSpace: "nowrap",
-                    transition: "color 0.12s",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!forking) e.currentTarget.style.color = "var(--accent)";
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!forking) e.currentTarget.style.color = "var(--text-dim)";
-                  }}
-                >
-                  <svg
-                    width="11"
-                    height="11"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <line x1="6" y1="3" x2="6" y2="15" />
-                    <circle cx="18" cy="6" r="3" />
-                    <circle cx="6" cy="18" r="3" />
-                    <path d="M18 9a9 9 0 0 1-9 9" />
-                  </svg>
-                  {forking ? "Creating…" : "New session"}
-                </button>
-              )}
-            </div>
-          )}
-          {time && <span style={{ fontSize: 12, color: "var(--text-dim)" }}>{time}</span>}
-        </div>
-      )}
+        )}
+        {time && <span style={{ fontSize: 12, color: "var(--text-dim)" }}>{time}</span>}
+      </div>
     </div>
   );
 }
@@ -518,6 +523,7 @@ function AssistantMessageView({
   message,
   isStreaming,
   toolResults,
+  toolCallDurations,
   modelNames,
   cwd,
   onOpenFile,
@@ -527,7 +533,8 @@ function AssistantMessageView({
 }: {
   message: AssistantMessage;
   isStreaming?: boolean;
-  toolResults?: Map<string, ToolResultMessage>;
+  toolResults?: ReadonlyMap<string, ToolResultMessage>;
+  toolCallDurations?: ReadonlyMap<string, number>;
   modelNames?: Record<string, string>;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
@@ -542,7 +549,7 @@ function AssistantMessageView({
     .filter(({ block }) => !isEmptyThinkingBlock(block, { isStreaming }));
   const blocks = blockItems.map(({ block }) => block);
   const [hovered, setHovered] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
   const streamStartRef = useRef<number | null>(null);
   const [tps, setTps] = useState<number | null>(null);
   const blockItemsRef = useRef(blockItems);
@@ -567,32 +574,12 @@ function AssistantMessageView({
     return secs > 0 ? secs : undefined;
   }, [message.timestamp, prevTimestamp]);
 
-  // Tool call durations derived from session file timestamps (accurate for completed messages)
-  // assistant message timestamp = when generation ended = when tools started running
-  // toolResult timestamp = when tool execution finished
-  const toolCallDurations = useMemo<Map<string, number>>(() => {
-    const map = new Map<string, number>();
-    if (!toolResults || !message.timestamp) return map;
-    for (const [callId, result] of toolResults) {
-      if (result.timestamp && message.timestamp) {
-        const secs = Math.round((result.timestamp - message.timestamp) / 1000);
-        if (secs > 0) map.set(callId, secs);
-      }
-    }
-    return map;
-  }, [toolResults, message.timestamp]);
-
   const textContent = blocks
     .filter((b): b is TextContent => b.type === "text")
     .map((b) => b.text)
     .join("\n");
 
-  const copyContent = () => {
-    void copyText(textContent).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
+  const copyContent = () => void copy(textContent);
 
   useEffect(() => {
     if (!isStreaming) {
@@ -866,10 +853,10 @@ function BlockView({
   onLoadDeferredContent,
 }: {
   block: AssistantContentBlock;
-  toolResults?: Map<string, ToolResultMessage>;
+  toolResults?: ReadonlyMap<string, ToolResultMessage>;
   isStreaming?: boolean;
   streamingDuration?: number;
-  toolCallDurations?: Map<string, number>;
+  toolCallDurations?: ReadonlyMap<string, number>;
   cwd?: string;
   onOpenFile?: (filePath: string) => void;
   onLoadDeferredContent?: (entryId: string, blockIndex?: number) => Promise<void>;
@@ -1329,7 +1316,8 @@ function SplitDiffCellView({ cell, side }: { cell: SplitDiffCell; side: "left" |
           ? "var(--bg-subtle)"
           : "transparent";
   const marker = cell.type === "added" ? "+" : cell.type === "removed" ? "-" : " ";
-  const markerColor = cell.type === "added" ? "#22c55e" : cell.type === "removed" ? "#f87171" : "var(--text-dim)";
+  const markerColor =
+    cell.type === "added" ? "var(--success)" : cell.type === "removed" ? "var(--danger)" : "var(--text-dim)";
 
   return (
     <div
@@ -1415,9 +1403,9 @@ function PatchTextView({ text }: { text: string }) {
                 : "transparent";
         const color =
           kind === "added"
-            ? "#22c55e"
+            ? "var(--success)"
             : kind === "removed"
-              ? "#f87171"
+              ? "var(--danger)"
               : kind === "hunk"
                 ? "var(--accent)"
                 : "var(--text)";
@@ -1430,9 +1418,9 @@ function PatchTextView({ text }: { text: string }) {
               background: bg,
               borderLeft:
                 kind === "added"
-                  ? "3px solid #22c55e"
+                  ? "3px solid var(--success)"
                   : kind === "removed"
-                    ? "3px solid #f87171"
+                    ? "3px solid var(--danger)"
                     : kind === "hunk"
                       ? "3px solid var(--accent)"
                       : "3px solid transparent",
@@ -1650,7 +1638,7 @@ function CustomMessageView({
   const isHiddenDisplay = message.display === false;
   const [contentExpanded, setContentExpanded] = useState(!isHiddenDisplay);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
   const text = getMessageText(message.content);
   const images = getMessageImages(message.content);
   const hasDetails = message.details !== undefined;
@@ -1658,12 +1646,7 @@ function CustomMessageView({
   const title = formatCustomType(message.customType);
   const time = formatTime(message.timestamp);
 
-  const copyContent = () => {
-    void copyText(text || detailsText).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
+  const copyContent = () => void copy(text || detailsText);
 
   return (
     <div style={{ marginBottom: 16 }}>

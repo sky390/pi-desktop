@@ -1,31 +1,22 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { readFile, stat, symlink, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
-
-const output = path.join(import.meta.dirname, "../../../.artifacts/test-modules", `channel-media-${process.pid}.mjs`);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
-  stdin: {
-    contents:
-      'export { ChannelMediaStore, CHANNEL_MEDIA_MAX_ATTACHMENTS, CHANNEL_MEDIA_MAX_BYTES, CHANNEL_MEDIA_TTL_MS } from "./media-store.ts";',
-    resolveDir: import.meta.dirname,
-    sourcefile: "channel-media-test-entry.ts",
-    loader: "ts",
-  },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
-});
+import { createDeferred, createManualScheduler } from "#test-timing";
 const { ChannelMediaStore, CHANNEL_MEDIA_MAX_ATTACHMENTS, CHANNEL_MEDIA_MAX_BYTES, CHANNEL_MEDIA_TTL_MS } =
-  await import(`${pathToFileURL(output).href}?v=${Date.now()}`);
+  await importTestBundle("src/agent-host/channels/media-store", {
+    packages: "external",
+    stdin: {
+      contents:
+        'export { ChannelMediaStore, CHANNEL_MEDIA_MAX_ATTACHMENTS, CHANNEL_MEDIA_MAX_BYTES, CHANNEL_MEDIA_TTL_MS } from "./media-store.ts";',
+      resolveDir: import.meta.dirname,
+      sourcefile: "channel-media-test-entry.ts",
+      loader: "ts",
+    },
+  });
 
 const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3]);
 
@@ -87,4 +78,38 @@ test("media staging refuses a symlinked root", async () => {
   const link = path.join(parent, "link");
   await symlink(real, link, "dir");
   await assert.rejects(new ChannelMediaStore(link).initialize(), /不是安全的本地目录/);
+});
+
+test("periodic and opportunistic cleanup stop when the media store is disposed", async () => {
+  const periodicRoot = mkdtempSync(path.join(tmpdir(), "pi-channel-media-periodic-"));
+  const scheduler = createManualScheduler();
+  const periodicCleanupFinished = createDeferred();
+  const periodic = new ChannelMediaStore(periodicRoot, { cleanupIntervalMs: 5, timers: scheduler });
+  let periodicCleanups = 0;
+  periodic.cleanupExpired = async () => {
+    periodicCleanups += 1;
+    if (periodicCleanups === 2) periodicCleanupFinished.resolve();
+  };
+  await periodic.initialize();
+  await scheduler.runNext();
+  await periodicCleanupFinished.promise;
+  assert.equal(periodicCleanups, 2, "the periodic timer should clean after startup");
+  await periodic.dispose();
+  assert.equal(scheduler.pendingCount(), 0);
+
+  let now = 1_000;
+  const opportunisticRoot = mkdtempSync(path.join(tmpdir(), "pi-channel-media-opportunistic-"));
+  const opportunistic = new ChannelMediaStore(opportunisticRoot, {
+    cleanupIntervalMs: 60_000,
+    now: () => now,
+  });
+  let opportunisticCleanups = 0;
+  opportunistic.cleanupExpired = async () => {
+    opportunisticCleanups += 1;
+  };
+  await opportunistic.initialize();
+  now += 60_001;
+  await opportunistic.stage("account", "event", [{ kind: "file", data: Buffer.from("x") }]);
+  await opportunistic.dispose();
+  assert.equal(opportunisticCleanups, 2);
 });

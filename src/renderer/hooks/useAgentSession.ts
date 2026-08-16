@@ -40,6 +40,23 @@ import {
   type SessionLoadTrace,
 } from "@/lib/session-performance";
 import { mergeHistoryTail, prependHistoryPage } from "@/lib/session-pagination";
+import { LatestRequestGate } from "@/lib/latest-request-gate";
+import {
+  connectTimedEventStream,
+  EventStreamConnectionManager,
+  type EventStreamConnectionResult,
+  type EventStreamConnectionStatus,
+} from "@/lib/event-stream-connection";
+import {
+  appendLocalHistoryMessage,
+  normalizeSessionHistory,
+  removeLastHistoryMessage,
+  replaceLastHistoryMessage,
+  type SessionHistoryValue,
+} from "@/lib/session-history-update";
+import { NOTICE_VISIBLE_MS, noticeExpiryDelay, noticeReducer, type NoticeType } from "@/lib/notice-queue";
+import { useI18n } from "@/i18n";
+import { sessionClientErrorMessage } from "@/lib/session-error-message";
 
 export type SessionData = SessionDetail;
 type AgentStateResponse = SessionRuntimeState;
@@ -92,22 +109,7 @@ function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
 type ExtensionUiCustomRequest = Extract<ExtensionUiRequest, { method: "custom" }>;
 type ExtensionUiQuestionnaireRequest = Extract<ExtensionUiRequest, { method: "questionnaire" }>;
-export type NoticeType = "info" | "success" | "warning" | "error";
-
-export type NoticeItem = {
-  id: string;
-  message: string;
-  type: NoticeType;
-  exiting?: boolean;
-};
-
-type NoticeState = {
-  visible: NoticeItem[];
-  pending: NoticeItem[];
-};
-
-type NoticeAction =
-  { type: "add"; notice: NoticeItem } | { type: "mark_oldest_exiting" } | { type: "remove"; id: string };
+export type { NoticeItem } from "@/lib/notice-queue";
 
 export type AgentPhase =
   | { kind: "waiting_model" }
@@ -167,25 +169,13 @@ const EVENT_STREAM_CONNECT_TIMEOUT_MS = 5_000;
 const INITIAL_HISTORY_TURNS = 20;
 const HISTORY_PAGE_MAX_BYTES = 1024 * 1024;
 const DEFERRED_CONTENT_CACHE_SIZE = 12;
-const MAX_NOTICES = 5;
-const NOTICE_VISIBLE_MS = 10000;
+
 const NOTICE_EXIT_ANIMATION_MS = 180;
 const SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " ", "Space", "Spacebar"]);
 
-type EventStreamConnectionStatus = "connected" | "timeout" | "closed";
-
-type EventStreamConnectionResult = {
-  status: EventStreamConnectionStatus;
-  unsubscribe: () => void;
-};
-
 class EventStreamConnectionError extends Error {
   constructor(public readonly status: Exclude<EventStreamConnectionStatus, "connected">) {
-    super(
-      status === "timeout"
-        ? "Timed out connecting to the agent event stream. Please try again."
-        : "Failed to connect to the agent event stream. Please try again.",
-    );
+    super(`EVENT_STREAM_${status.toUpperCase()}`);
     this.name = "EventStreamConnectionError";
   }
 }
@@ -199,50 +189,6 @@ function createNoticeId(): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function markOldestNoticeExiting(notices: NoticeItem[]): NoticeItem[] {
-  const index = notices.findIndex((notice) => !notice.exiting);
-  if (index === -1) return notices;
-  return notices.map((notice, i) => (i === index ? { ...notice, exiting: true } : notice));
-}
-
-function fillPendingNotices(visible: NoticeItem[], pending: NoticeItem[]): NoticeState {
-  let nextVisible = visible;
-  let nextPending = pending;
-  while (nextPending.length > 0 && nextVisible.length < MAX_NOTICES) {
-    const [next, ...rest] = nextPending;
-    nextVisible = [...nextVisible, next];
-    nextPending = rest;
-  }
-  if (nextPending.length > 0 && !nextVisible.some((notice) => notice.exiting)) {
-    nextVisible = markOldestNoticeExiting(nextVisible);
-  }
-  return { visible: nextVisible, pending: nextPending };
-}
-
-function noticeReducer(state: NoticeState, action: NoticeAction): NoticeState {
-  switch (action.type) {
-    case "add": {
-      if (state.visible.some((notice) => notice.exiting) || state.visible.length >= MAX_NOTICES) {
-        return {
-          visible: state.visible.some((notice) => notice.exiting)
-            ? state.visible
-            : markOldestNoticeExiting(state.visible),
-          pending: [...state.pending, action.notice],
-        };
-      }
-      return { ...state, visible: [...state.visible, action.notice] };
-    }
-    case "mark_oldest_exiting":
-      return { ...state, visible: markOldestNoticeExiting(state.visible) };
-    case "remove": {
-      const visible = state.visible.filter((notice) => notice.id !== action.id);
-      return fillPendingNotices(visible, state.pending);
-    }
-    default:
-      return state;
-  }
 }
 
 function extractMessageText(message: Partial<AgentMessage>): string {
@@ -320,6 +266,7 @@ type SlashCommandsResponse = {
 };
 
 export function useAgentSession(opts: UseAgentSessionOptions) {
+  const { t } = useI18n();
   const {
     session,
     newSessionCwd,
@@ -391,7 +338,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [loadingOlder, setLoadingOlder] = useState(false);
 
   const eventUnsubRef = useRef<(() => void) | null>(null);
+  const [eventConnectionManager] = useState(() => new EventStreamConnectionManager(eventUnsubRef));
   const modelRefreshRequestRef = useRef<string | null>(null);
+  const modelListRequestGateRef = useRef(new LatestRequestGate());
+  const modelListSizeRef = useRef(0);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const agentRunningRef = useRef(false);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
@@ -467,11 +417,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   })();
 
   const commitHistory = useCallback((nextMessages: AgentMessage[], nextEntryIds: string[]) => {
-    loadedMessagesRef.current = nextMessages;
-    loadedEntryIdsRef.current = nextEntryIds;
-    setMessages(nextMessages);
-    setEntryIds(nextEntryIds);
+    const normalized = normalizeSessionHistory(nextMessages, nextEntryIds);
+    loadedMessagesRef.current = normalized.messages;
+    loadedEntryIdsRef.current = normalized.entryIds;
+    setMessages(normalized.messages);
+    setEntryIds(normalized.entryIds);
   }, []);
+
+  const updateHistory = useCallback(
+    (update: (current: SessionHistoryValue) => SessionHistoryValue) => {
+      const next = update({ messages: loadedMessagesRef.current, entryIds: loadedEntryIdsRef.current });
+      commitHistory(next.messages, next.entryIds);
+    },
+    [commitHistory],
+  );
 
   const updatePagingState = useCallback((revision: string, cursor?: string) => {
     historyRevisionRef.current = revision;
@@ -508,7 +467,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             if (showLoading) {
               setData(null);
               setActiveLeafId(null);
-              setMessages([]);
+              commitHistory([], []);
               setError(null);
             }
             return null;
@@ -516,10 +475,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           throw e;
         }
         const d = result;
-        if (sessionIdRef.current !== sid || loadGeneration !== historyGenerationRef.current) return null;
+        if (sessionIdRef.current !== sid || loadGeneration !== historyGenerationRef.current) {
+          failSessionLoadTrace(trace);
+          traceFailed = true;
+          return null;
+        }
 
         setData(d);
         setActiveLeafId(d.leafId);
+        const replacedCommitTrace = pendingSessionLoadTraceRef.current;
+        if (replacedCommitTrace && replacedCommitTrace !== trace) failSessionLoadTrace(replacedCommitTrace);
         pendingSessionLoadTraceRef.current = trace;
         const mergedHistory = mergeHistoryTail(
           {
@@ -556,13 +521,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         return d.agentState ?? null;
       } catch (e) {
         if (!traceFailed) failSessionLoadTrace(trace);
-        setError(String(e));
+        setError(sessionClientErrorMessage(e, t, t("sessionLoadFailed", "Failed to load session.")));
         return null;
       } finally {
         if (showLoading) setLoading(false);
       }
     },
-    [commitHistory, updatePagingState],
+    [commitHistory, t, updatePagingState],
   );
 
   useEffect(() => {
@@ -574,6 +539,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       requestAnimationFrame(() => finishSessionLoadTrace(trace));
     });
   }, [messages]);
+
+  useEffect(
+    () => () => {
+      const trace = pendingSessionLoadTraceRef.current;
+      pendingSessionLoadTraceRef.current = null;
+      if (trace) failSessionLoadTrace(trace);
+    },
+    [],
+  );
 
   const contextGenRef = useRef(0);
 
@@ -789,52 +763,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [ensureNewSession]);
 
-  const connectEvents = useCallback(async (sid: string): Promise<EventStreamConnectionResult> => {
-    if (eventUnsubRef.current) {
-      eventUnsubRef.current();
-      eventUnsubRef.current = null;
-    }
-
-    let settled = false;
-    let resolveResult: (r: EventStreamConnectionResult) => void = () => {};
-    const resultPromise = new Promise<EventStreamConnectionResult>((resolve) => {
-      resolveResult = resolve;
-    });
-    const timeout = setTimeout(() => {
-      if (!settled) {
-        settled = true;
-        resolveResult({ status: "timeout", unsubscribe: () => {} });
-      }
-    }, EVENT_STREAM_CONNECT_TIMEOUT_MS);
-
-    const unsubscribe = await subscribeAgentEvents(sid, (event) => {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timeout);
-        resolveResult({ status: "connected", unsubscribe: () => eventUnsubRef.current?.() });
-      }
-      handleAgentEventRef.current?.(event as AgentEvent);
-    });
-    eventUnsubRef.current = unsubscribe;
-
-    // IPC is immediately ready — mark connected if no event yet
-    if (!settled) {
-      settled = true;
-      clearTimeout(timeout);
-      resolveResult({ status: "connected", unsubscribe });
-    }
-
-    return resultPromise;
-  }, []);
+  const connectEvents = useCallback(
+    async (sid: string): Promise<EventStreamConnectionResult> => {
+      return connectTimedEventStream({
+        manager: eventConnectionManager,
+        subscribe: (onEvent) => subscribeAgentEvents(sid, onEvent),
+        onEvent: (event) => handleAgentEventRef.current?.(event as AgentEvent),
+        timeoutMs: EVENT_STREAM_CONNECT_TIMEOUT_MS,
+      });
+    },
+    [eventConnectionManager],
+  );
 
   const ensureEventsConnected = useCallback(
     async (sid: string) => {
       const result = await connectEvents(sid);
       if (result.status === "connected") return;
-      if (eventUnsubRef.current) {
-        eventUnsubRef.current();
-        eventUnsubRef.current = null;
-      }
       throw new EventStreamConnectionError(result.status);
     },
     [connectEvents],
@@ -905,6 +849,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         id: notice.id ?? createNoticeId(),
         message,
         type: notice.type ?? "info",
+        expiresAt: Date.now() + NOTICE_VISIBLE_MS,
       },
     });
   }, []);
@@ -1131,12 +1076,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           void finishPromptWithoutStream(sessionIdRef.current);
           break;
         case "prompt_error":
-          addNotice({ type: "error", message: (event.errorMessage as string | undefined) ?? "Command failed" });
+          addNotice({
+            type: "error",
+            message: (event.errorMessage as string | undefined) ?? t("commandFailed", "Command failed"),
+          });
           break;
         case "extension_error":
           addNotice({
             type: "error",
-            message: (event.error as string | undefined) ?? "Extension command failed",
+            message: (event.error as string | undefined) ?? t("extensionCommandFailed", "Extension command failed"),
           });
           break;
         case "message_start":
@@ -1170,15 +1118,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             const deliveredKey = userMessageKey(delivered);
             const optimisticKey = optimisticUserMessageKeyRef.current;
             optimisticUserMessageKeyRef.current = null;
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
+            updateHistory((current) => {
+              const last = current.messages[current.messages.length - 1];
               if (optimisticKey && last?.role === "user" && userMessageKey(last) === optimisticKey) {
-                return optimisticKey === deliveredKey ? prev : [...prev.slice(0, -1), delivered];
+                return optimisticKey === deliveredKey ? current : replaceLastHistoryMessage(current, delivered);
               }
-              return [...prev, delivered];
+              return appendLocalHistoryMessage(current, delivered);
             });
           } else if (completed) {
-            setMessages((prev) => [...prev, normalizeToolCalls(completed)]);
+            updateHistory((current) => appendLocalHistoryMessage(current, normalizeToolCalls(completed)));
           }
           dispatch({ type: "reset" });
           setAgentPhase({ kind: "waiting_model" });
@@ -1242,7 +1190,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           break;
       }
     },
-    [addNotice, finishPromptWithoutStream, handleExtensionUiRequest, loadSession, onAgentEnd],
+    [addNotice, finishPromptWithoutStream, handleExtensionUiRequest, loadSession, onAgentEnd, t, updateHistory],
   );
   handleAgentEventRef.current = handleAgentEvent;
 
@@ -1265,7 +1213,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           : message,
         timestamp: Date.now(),
       };
-      setMessages((prev) => [...prev, userMsg]);
+      updateHistory((current) => appendLocalHistoryMessage(current, userMsg));
       optimisticUserMessageKeyRef.current = userMessageKey(userMsg);
       promptRunIdRef.current = promptRunId;
       agentRunningRef.current = true;
@@ -1320,14 +1268,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         console.error("Failed to send message:", e);
         const optimisticKey = optimisticUserMessageKeyRef.current;
         if (optimisticKey) {
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            return last?.role === "user" && userMessageKey(last) === optimisticKey ? prev.slice(0, -1) : prev;
+          updateHistory((current) => {
+            const last = current.messages[current.messages.length - 1];
+            return last?.role === "user" && userMessageKey(last) === optimisticKey
+              ? removeLastHistoryMessage(current)
+              : current;
           });
         }
         addNotice({
           type: "error",
-          message: e instanceof Error ? e.message : String(e),
+          message: sessionClientErrorMessage(e, t, t("messageSendFailed", "Failed to send message.")),
         });
         optimisticUserMessageKeyRef.current = null;
         agentRunningRef.current = false;
@@ -1343,12 +1293,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       newSessionCwd,
       newSessionModel,
       session,
+      t,
       agentRunning,
       ensureNewSession,
       ensureEventsConnected,
       promoteNewSession,
       waitForPromptSettlement,
       addNotice,
+      updateHistory,
     ],
   );
 
@@ -1486,6 +1438,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       );
       setModelThinkingLevels(d.thinkingLevels ?? {});
       setModelThinkingLevelMaps(d.thinkingLevelMaps ?? {});
+      modelListSizeRef.current = nextList.length;
       setModelList(nextList);
       setModelCatalog(d.catalog);
       if (isNew) {
@@ -1501,10 +1454,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const loadModels = useCallback(
     async (signal?: AbortSignal) => {
+      const generation = modelListRequestGateRef.current.begin();
+      const activeRefreshRequestId = modelRefreshRequestRef.current;
+      if (activeRefreshRequestId) {
+        modelRefreshRequestRef.current = null;
+        setModelRefreshing(false);
+        void cancelModelsRefresh(activeRefreshRequestId).catch(() => {});
+      }
       const modelCwd = newSessionCwd ?? session?.cwd ?? "";
       if (signal?.aborted) return;
       const d = await listModels(modelCwd || undefined);
-      if (signal?.aborted) return;
+      if (signal?.aborted || !modelListRequestGateRef.current.isCurrent(generation)) return;
       applyModelsResult(d);
     },
     [applyModelsResult, newSessionCwd, session?.cwd],
@@ -1514,6 +1474,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const requestId = modelRefreshRequestRef.current;
     if (!requestId) return;
     modelRefreshRequestRef.current = null;
+    modelListRequestGateRef.current.invalidate();
     setModelRefreshing(false);
     void cancelModelsRefresh(requestId).catch(() => {});
   }, []);
@@ -1522,18 +1483,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const previousRequestId = modelRefreshRequestRef.current;
     if (previousRequestId) void cancelModelsRefresh(previousRequestId).catch(() => {});
     const requestId = `models_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    const generation = modelListRequestGateRef.current.begin();
     modelRefreshRequestRef.current = requestId;
     setModelRefreshing(true);
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
     try {
       const result = await requestModelsRefresh(modelCwd || undefined, requestId);
-      if (modelRefreshRequestRef.current !== requestId) return;
+      if (modelRefreshRequestRef.current !== requestId || !modelListRequestGateRef.current.isCurrent(generation))
+        return;
       applyModelsResult(result);
     } catch {
-      if (modelRefreshRequestRef.current !== requestId) return;
+      if (modelRefreshRequestRef.current !== requestId || !modelListRequestGateRef.current.isCurrent(generation))
+        return;
       addNotice({
         type: "error",
-        message: "Unable to refresh the model directory. Cached models remain available.",
+        message: t(
+          "modelDirectoryRefreshFailed",
+          "Unable to refresh the model directory. Cached models remain available.",
+        ),
       });
     } finally {
       if (modelRefreshRequestRef.current === requestId) {
@@ -1541,7 +1508,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         setModelRefreshing(false);
       }
     }
-  }, [addNotice, applyModelsResult, newSessionCwd, session?.cwd]);
+  }, [addNotice, applyModelsResult, newSessionCwd, session?.cwd, t]);
 
   const handleBuiltinSlashCommand = useCallback(
     async (text: string): Promise<BuiltinSlashCommandResult> => {
@@ -1557,7 +1524,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         if (result.error) {
           addNotice({ type: "error", message: result.error });
         } else if (result.action !== "openSessionStats") {
-          addNotice({ type: "success", message: result.message ?? "Command completed" });
+          addNotice({ type: "success", message: result.message ?? t("commandCompleted", "Command completed") });
         }
         return result;
       };
@@ -1565,7 +1532,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       try {
         switch (commandName) {
           case "compact": {
-            if (!sid || isCompacting) return complete({ handled: true, error: "No active session to compact" });
+            if (!sid || isCompacting) {
+              return complete({
+                handled: true,
+                error: t("noActiveSessionToCompact", "No active session to compact"),
+              });
+            }
             setIsCompacting(true);
             setCompactError(null);
             setCompactResult(null);
@@ -1575,26 +1547,36 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             });
             setCompactResult(readCompactResult(result, "manual"));
             if (await loadSession(sid, true)) promoteNewSession();
-            return complete({ handled: true, message: "Compacted context" });
+            return complete({ handled: true, message: t("contextCompacted", "Compacted context") });
           }
 
           case "reload": {
-            if (!sid) return complete({ handled: true, error: "No active session to reload" });
+            if (!sid) {
+              return complete({ handled: true, error: t("noActiveSessionToReload", "No active session to reload") });
+            }
             await sendAgentCommand(sid, { type: "reload" });
             await Promise.all([loadSession(sid, false, true), loadTools(sid), loadSlashCommands(), loadModels()]);
-            return complete({ handled: true, message: "Reloaded session resources" });
+            return complete({
+              handled: true,
+              message: t("sessionResourcesReloaded", "Reloaded session resources"),
+            });
           }
 
           case "name": {
-            if (!sid) return complete({ handled: true, error: "No active session to name" });
-            if (!args) return complete({ handled: true, error: "Usage: /name <name>" });
+            if (!sid) {
+              return complete({ handled: true, error: t("noActiveSessionToName", "No active session to name") });
+            }
+            if (!args) return complete({ handled: true, error: t("nameCommandUsage", "Usage: /name <name>") });
             await sendAgentCommand(sid, { type: "set_session_name", name: args });
             if (await loadSession(sid)) promoteNewSession();
-            return complete({ handled: true, message: `Session renamed to ${args}` });
+            return complete({
+              handled: true,
+              message: t("sessionRenamedTo", "Session renamed to {name}").replace("{name}", args),
+            });
           }
 
           case "session": {
-            if (!sid) return complete({ handled: true, error: "No active session" });
+            if (!sid) return complete({ handled: true, error: t("noActiveSession", "No active session") });
             const stats = await sendAgentCommand<SessionStatsInfo>(sid, { type: "get_session_stats" });
             if (stats) {
               setSessionStatsOverride(stats);
@@ -1604,12 +1586,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           }
 
           case "copy": {
-            if (!sid) return complete({ handled: true, error: "No active session" });
+            if (!sid) return complete({ handled: true, error: t("noActiveSession", "No active session") });
             const data = await sendAgentCommand<LastAssistantTextResponse>(sid, { type: "get_last_assistant_text" });
             const textToCopy = data?.text ?? "";
-            if (!textToCopy) return complete({ handled: true, error: "No assistant message to copy" });
+            if (!textToCopy) {
+              return complete({
+                handled: true,
+                error: t("noAssistantMessageToCopy", "No assistant message to copy"),
+              });
+            }
             await navigator.clipboard.writeText(textToCopy);
-            return complete({ handled: true, message: "Copied last assistant message" });
+            return complete({
+              handled: true,
+              message: t("copiedLastAssistantMessage", "Copied last assistant message"),
+            });
           }
 
           default:
@@ -1631,6 +1621,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       loadTools,
       promoteNewSession,
       onSessionStatsPanelOpen,
+      t,
     ],
   );
 
@@ -1638,25 +1629,47 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   // the real user message when pi delivers it (user message_end event). An
   // optimistic chat bubble here would duplicate the queue panel and turn into
   // a ghost message if the queue is recalled.
-  const handleSteer = useCallback(async (message: string, images?: AttachedImage[]) => {
-    const sid = sessionIdRef.current;
-    if (!sid) return;
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
-    try {
-      await sendAgentCommand(sid, {
-        type: "steer",
-        message,
-        ...(piImages?.length ? { images: piImages } : {}),
-      });
-    } catch (e) {
-      console.error("Failed to steer:", e);
-    }
-  }, []);
+  const handleSteer = useCallback(
+    async (message: string, images?: AttachedImage[]) => {
+      const sid = sessionIdRef.current;
+      if (!sid) {
+        const error = new Error("The active session is no longer available");
+        addNotice({
+          type: "error",
+          message: t("steerFailedNotQueued", "Unable to steer the running agent. The message was not queued."),
+        });
+        throw error;
+      }
+      const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+      try {
+        await sendAgentCommand(sid, {
+          type: "steer",
+          message,
+          ...(piImages?.length ? { images: piImages } : {}),
+        });
+      } catch (error) {
+        console.error("Failed to steer:", error);
+        addNotice({
+          type: "error",
+          message: t("steerFailedNotQueued", "Unable to steer the running agent. The message was not queued."),
+        });
+        throw error;
+      }
+    },
+    [addNotice, t],
+  );
 
   const handlePromptWithStreamingBehavior = useCallback(
     async (message: string, behavior: "steer" | "followUp", images?: AttachedImage[]) => {
       const sid = sessionIdRef.current;
-      if (!sid) return;
+      if (!sid) {
+        const error = new Error("The active session is no longer available");
+        addNotice({
+          type: "error",
+          message: t("promptQueueFailedNotQueued", "Unable to queue this prompt. The message was not queued."),
+        });
+        throw error;
+      }
       const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
       try {
         await sendAgentCommand(sid, {
@@ -1665,27 +1678,47 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           streamingBehavior: behavior,
           ...(piImages?.length ? { images: piImages } : {}),
         });
-      } catch (e) {
-        console.error("Failed to queue prompt:", e);
+      } catch (error) {
+        console.error("Failed to queue prompt:", error);
+        addNotice({
+          type: "error",
+          message: t("promptQueueFailedNotQueued", "Unable to queue this prompt. The message was not queued."),
+        });
+        throw error;
       }
     },
-    [],
+    [addNotice, t],
   );
 
-  const handleFollowUp = useCallback(async (message: string, images?: AttachedImage[]) => {
-    const sid = sessionIdRef.current;
-    if (!sid) return;
-    const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
-    try {
-      await sendAgentCommand(sid, {
-        type: "follow_up",
-        message,
-        ...(piImages?.length ? { images: piImages } : {}),
-      });
-    } catch (e) {
-      console.error("Failed to follow up:", e);
-    }
-  }, []);
+  const handleFollowUp = useCallback(
+    async (message: string, images?: AttachedImage[]) => {
+      const sid = sessionIdRef.current;
+      if (!sid) {
+        const error = new Error("The active session is no longer available");
+        addNotice({
+          type: "error",
+          message: t("followUpQueueFailedNotQueued", "Unable to queue this follow-up. The message was not queued."),
+        });
+        throw error;
+      }
+      const piImages = images?.map((img) => ({ type: "image" as const, data: img.data, mimeType: img.mimeType }));
+      try {
+        await sendAgentCommand(sid, {
+          type: "follow_up",
+          message,
+          ...(piImages?.length ? { images: piImages } : {}),
+        });
+      } catch (error) {
+        console.error("Failed to follow up:", error);
+        addNotice({
+          type: "error",
+          message: t("followUpQueueFailedNotQueued", "Unable to queue this follow-up. The message was not queued."),
+        });
+        throw error;
+      }
+    },
+    [addNotice, t],
+  );
 
   const handleAbortCompaction = useCallback(async () => {
     const sid = sessionIdRef.current;
@@ -1711,9 +1744,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
     } catch (e) {
       console.error("Failed to recall queued messages:", e);
-      addNotice({ type: "error", message: "Failed to recall queued messages" });
+      addNotice({ type: "error", message: t("queuedMessagesRecallFailed", "Failed to recall queued messages") });
     }
-  }, [opts.chatInputRef, addNotice]);
+  }, [opts.chatInputRef, addNotice, t]);
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevelOption) => {
     setThinkingLevel(level);
@@ -1805,8 +1838,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     historyGenerationRef.current += 1;
     historyRevisionRef.current = null;
     previousCursorRef.current = null;
-    loadedMessagesRef.current = [];
-    loadedEntryIdsRef.current = [];
+    commitHistory([], []);
     olderRequestRef.current = null;
     deferredContentCacheRef.current.clear();
     deferredContentRequestRef.current.clear();
@@ -1872,8 +1904,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       disposed = true;
       historyGenerationRef.current += 1;
       unsubscribeLiveSync?.();
-      eventUnsubRef.current?.();
-      eventUnsubRef.current = null;
+      eventConnectionManager.invalidate();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- session identity owns this lifecycle effect.
   }, []);
@@ -1943,14 +1974,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     const load = () => {
       loadModels(controller.signal).catch((e) => {
-        if (controller.signal.aborted) return;
-        if (e instanceof DOMException && e.name === "AbortError") return;
+        if (controller.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
         if (attempt < 3) {
           attempt += 1;
           retryTimer = setTimeout(load, 300 * attempt);
           return;
         }
+        console.error("Failed to load model directory:", e);
         setModelListError(e instanceof Error ? e.message : String(e));
+        addNotice({
+          type: "warning",
+          message:
+            modelListSizeRef.current > 0
+              ? t(
+                  "modelDirectoryLoadFailedCached",
+                  "Unable to load the model directory. Cached models remain available; retry from the model picker.",
+                )
+              : t(
+                  "modelDirectoryLoadFailed",
+                  "Unable to load the model directory. Retry from the model picker or check the Agent Host connection.",
+                ),
+        });
       });
     };
     setModelListError(null);
@@ -1959,7 +2003,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       controller.abort();
       if (retryTimer) clearTimeout(retryTimer);
     };
-  }, [loadModels, modelsRefreshKey]);
+  }, [addNotice, loadModels, modelsRefreshKey, t]);
 
   useEffect(() => cancelModelRefresh, [cancelModelRefresh, newSessionCwd, session?.cwd]);
 
@@ -1981,15 +2025,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const exiting = noticeState.visible.find((notice) => notice.exiting);
     if (exiting) {
       const t = setTimeout(() => {
-        dispatchNotice({ type: "remove", id: exiting.id });
+        dispatchNotice({ type: "remove", id: exiting.id, now: Date.now() });
       }, NOTICE_EXIT_ANIMATION_MS);
       return () => clearTimeout(t);
     }
     const oldest = noticeState.visible[0];
     if (!oldest) return;
-    const t = setTimeout(() => {
-      dispatchNotice({ type: "mark_oldest_exiting" });
-    }, NOTICE_VISIBLE_MS);
+    const t = setTimeout(
+      () => {
+        dispatchNotice({ type: "mark_oldest_exiting" });
+      },
+      noticeExpiryDelay(oldest, Date.now()),
+    );
     return () => clearTimeout(t);
   }, [noticeState.visible]);
 
@@ -2034,7 +2081,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     loadingOlder,
     historyRevision,
     notices: noticeState.visible,
-    dismissNotice: (id: string) => dispatchNotice({ type: "remove", id }),
+    dismissNotice: (id: string) => dispatchNotice({ type: "remove", id, now: Date.now() }),
     extensionDialog,
     extensionCustomUi,
     extensionQuestionnaire,

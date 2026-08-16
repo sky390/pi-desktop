@@ -1,14 +1,13 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { CredentialSynchronizationError } from "@earendil-works/pi-coding-agent";
-import { build } from "esbuild";
 
 const root = path.resolve(import.meta.dirname, "..", "..");
 // Desktop config lives next to the agent dir (<base>/desktop), so isolate both
@@ -26,26 +25,18 @@ process.once("exit", () => rmSync(isolatedBaseDirectory, { recursive: true, forc
 // (which pi's CLI never reads).
 const settingsPath = path.join(isolatedAgentDirectory, "settings.json");
 const desktopSettingsPath = path.join(isolatedBaseDirectory, "desktop", "settings.json");
+
+test.after(() => rmSync(isolatedAgentDirectory, { recursive: true, force: true }));
 let modulePromise;
 
 async function loadHandlersModule() {
   if (modulePromise) return modulePromise;
   modulePromise = (async () => {
-    const outputDirectory = path.join(root, ".artifacts", "test-modules");
-    mkdirSync(outputDirectory, { recursive: true });
-    const outputFile = path.join(outputDirectory, `handlers-${process.pid}.mjs`);
-    await build({
+    return importTestBundle("src/agent-host/handlers", {
+      packages: "external",
       absWorkingDir: root,
       entryPoints: ["src/agent-host/handlers.ts"],
-      outfile: outputFile,
-      bundle: true,
-      format: "esm",
-      platform: "node",
-      packages: "external",
-      sourcemap: false,
-      logLevel: "silent",
     });
-    return import(`${pathToFileURL(outputFile).href}?v=${Date.now()}`);
   })();
   return modulePromise;
 }
@@ -142,6 +133,30 @@ test("host.refresh performs a full soft reset and re-broadcasts running state", 
   assert.equal(again.sessions.count, result.sessions.count);
 });
 
+test("agent.new uses a unique temporary lock key for every request", async () => {
+  const { createAgentNewLockKey } = await loadHandlersModule();
+  const keys = Array.from({ length: 1_000 }, () => createAgentNewLockKey());
+
+  assert.equal(new Set(keys).size, keys.length);
+  assert.ok(keys.every((key) => /^__new__[0-9a-f-]{36}$/.test(key)));
+});
+
+test("channel initialization failure is reported without an unhandled rejection", async () => {
+  const { initializeChannels } = await loadHandlersModule();
+  const reports = [];
+  initializeChannels(
+    {
+      async initialize() {
+        throw new Error("media init failed?token=sensitive-token");
+      },
+    },
+    (message) => reports.push(message),
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(reports, ["media init failed?token=[REDACTED]"]);
+});
+
 test("credential mutation failures distinguish committed state from an unverified mutation", async () => {
   const { credentialMutationFailure } = await loadHandlersModule();
   const synchronizationError = new CredentialSynchronizationError("test-provider", "setRuntimeApiKey", undefined, {
@@ -189,6 +204,51 @@ test("credential mutation failures distinguish committed state from an unverifie
   );
 });
 
+test("model list projection isolates provider availability failures and keeps the last known state", async () => {
+  const { projectModelsList } = await loadHandlersModule();
+  const goodModel = { id: "fresh", name: "Fresh model", provider: "good", reasoning: false };
+  const cachedModel = { id: "cached", name: "Cached model", provider: "broken", reasoning: false };
+  const result = await projectModelsList(
+    {
+      getProviders() {
+        return [{ id: "good" }, { id: "broken" }];
+      },
+      getAvailableSnapshot() {
+        return [cachedModel];
+      },
+      async getAvailable(providerId) {
+        if (providerId === "good") return [goodModel];
+        throw new Error("secret provider failure detail");
+      },
+    },
+    {
+      getEnabledModels() {
+        return undefined;
+      },
+      getDefaultProvider() {
+        return undefined;
+      },
+      getDefaultModel() {
+        return undefined;
+      },
+    },
+    { source: "network", refreshed: true, aborted: false, warnings: [] },
+  );
+
+  assert.deepEqual(result.models.map((model) => `${model.provider}/${model.id}`).sort(), [
+    "broken/cached",
+    "good/fresh",
+  ]);
+  assert.deepEqual(result.catalog.warnings, [
+    {
+      provider: "broken",
+      code: "PROVIDER_AVAILABILITY_FAILED",
+      message: "Unable to check broken model availability; the last known state remains available.",
+    },
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /secret provider failure detail/);
+});
+
 test("file, git, worktree, skill, plugin, and system handlers return contract-shaped results", async (t) => {
   const base = mkdtempSync(path.join(tmpdir(), "pi-handler-test-"));
   t.after(() => rmSync(base, { recursive: true, force: true }));
@@ -196,10 +256,24 @@ test("file, git, worktree, skill, plugin, and system handlers return contract-sh
   mkdirSync(path.join(project, "nested"), { recursive: true });
   const textFile = path.join(project, "hello.txt");
   writeFileSync(textFile, "hello handler tests\n");
+  const outsideFile = path.join(base, "outside.txt");
+  writeFileSync(outsideFile, "must not become an allowed root\n");
 
   const { handlers } = await captureHandlers();
   assert.deepEqual(await handlers["system.allowRoot"]({ path: project }), { ok: true });
   assert.deepEqual(await handlers["system.validateCwd"]({ path: project }), { ok: true, path: project });
+  assert.deepEqual(await handlers["system.validateCwd"]({ path: outsideFile }), {
+    ok: false,
+    error: "Not a directory",
+  });
+  await assert.rejects(
+    handlers["system.allowRoot"]({ path: outsideFile }),
+    (error) => error.code === "BAD_REQUEST" && /Not a directory/.test(error.message),
+  );
+  await assert.rejects(
+    handlers["system.allowRoot"]({ path: path.join(base, "missing") }),
+    (error) => error.code === "BAD_REQUEST" && /Directory does not exist/.test(error.message),
+  );
 
   const listed = await handlers["files.list"]({ path: project });
   assert.equal(
@@ -215,6 +289,17 @@ test("file, git, worktree, skill, plugin, and system handlers return contract-sh
   assert.equal(Buffer.from(downloaded.base64, "base64").toString("utf8"), "hello handler tests\n");
   assert.equal(downloaded.size, Buffer.byteLength("hello handler tests\n"));
 
+  const oversizedFile = path.join(project, "oversized.bin");
+  writeFileSync(oversizedFile, "");
+  truncateSync(oversizedFile, 50 * 1024 * 1024 + 1);
+  await assert.rejects(
+    handlers["files.download"]({ path: oversizedFile }),
+    (error) =>
+      error.code === "RESULT_TOO_LARGE" &&
+      error.detail?.size === 50 * 1024 * 1024 + 1 &&
+      error.detail?.maxBytes === 50 * 1024 * 1024,
+  );
+
   const meta = await handlers["files.meta"]({ path: textFile });
   assert.equal(meta.language, "text");
   assert.equal(meta.mime, "text/plain");
@@ -226,6 +311,22 @@ test("file, git, worktree, skill, plugin, and system handlers return contract-sh
   const index = await handlers["files.index"]({ root: project, query: "hello" });
   assert.equal(Array.isArray(index.files), true);
   assert.equal(index.files.includes("hello.txt"), true);
+
+  let deepDirectory = project;
+  for (let depth = 0; depth < 9; depth += 1) {
+    deepDirectory = path.join(deepDirectory, `depth-${depth}`);
+    mkdirSync(deepDirectory);
+  }
+  writeFileSync(path.join(deepDirectory, "beyond-depth.txt"), "too deep", "utf8");
+  const depthLimitedIndex = await handlers["files.index"]({ root: project });
+  assert.equal(
+    depthLimitedIndex.files.includes(
+      "depth-0/depth-1/depth-2/depth-3/depth-4/depth-5/depth-6/depth-7/depth-8/beyond-depth.txt",
+    ),
+    false,
+  );
+  assert.equal(depthLimitedIndex.truncated, true);
+  assert.equal(depthLimitedIndex.truncatedReason, "depth");
 
   const git = await handlers["git.status"]({ path: project });
   assert.equal(git.isGit, false);
@@ -262,9 +363,20 @@ test("session, model configuration, and auth handlers isolate state and preserve
     ["NOT_FOUND", "BAD_REQUEST"].includes(error.code),
   );
 
-  assert.deepEqual(await handlers["modelsConfig.get"](), { providers: {} });
+  const initialModels = await handlers["modelsConfig.get"]();
+  assert.deepEqual(initialModels.config, { providers: {} });
+  assert.equal(initialModels.version, "missing");
   await assert.rejects(handlers["modelsConfig.set"]({}), (error) => error.code === "BAD_REQUEST");
-  assert.deepEqual(await handlers["modelsConfig.set"]({ providers: {} }), { ok: true });
+  await assert.rejects(
+    handlers["modelsConfig.set"]({ config: { providers: {} } }),
+    (error) => error.code === "BAD_REQUEST",
+  );
+  const firstSave = await handlers["modelsConfig.set"]({
+    config: { providers: {} },
+    expectedVersion: initialModels.version,
+  });
+  assert.equal(firstSave.ok, true);
+  assert.match(firstSave.version, /^sha256:/);
 
   const v084Config = {
     providers: {
@@ -281,8 +393,27 @@ test("session, model configuration, and auth handlers isolate state and preserve
     },
     futureTopLevel: "preserved",
   };
-  assert.deepEqual(await handlers["modelsConfig.set"](v084Config), { ok: true });
-  assert.deepEqual(await handlers["modelsConfig.get"](), v084Config);
+  const editorOne = await handlers["modelsConfig.get"]();
+  const editorTwo = await handlers["modelsConfig.get"]();
+  const winningSave = await handlers["modelsConfig.set"]({
+    config: v084Config,
+    expectedVersion: editorOne.version,
+  });
+  assert.equal(winningSave.ok, true);
+  assert.notEqual(winningSave.version, editorOne.version);
+  await assert.rejects(
+    handlers["modelsConfig.set"]({
+      config: { providers: { stale: { api: "openai-completions" } } },
+      expectedVersion: editorTwo.version,
+    }),
+    (error) =>
+      error.code === "CONFLICT" &&
+      error.detail.expectedVersion === editorTwo.version &&
+      error.detail.currentVersion === winningSave.version,
+  );
+  const winningSnapshot = await handlers["modelsConfig.get"]();
+  assert.deepEqual(winningSnapshot.config, v084Config);
+  assert.equal(winningSnapshot.version, winningSave.version);
 
   const models = await handlers["models.list"]({ cwd: root });
   assert.equal(models.catalog.source, "offline");
@@ -317,7 +448,7 @@ test("session, model configuration, and auth handlers isolate state and preserve
   assert.deepEqual(await handlers["auth.loginCancel"]({ provider: "handler-test" }), { ok: true });
   await assert.rejects(
     handlers["auth.loginSubmit"]({ provider: "one", token: "two-token", code: "code" }),
-    (error) => error.code === "BAD_REQUEST",
+    (error) => error.code === "NOT_FOUND",
   );
 
   const modelsPath = path.join(isolatedAgentDirectory, "models.json");
@@ -361,11 +492,11 @@ test("built-in provider overlays persist, restore defaults, and filter the model
     enabledModels: [firstModel.id],
   });
   const stored = await handlers["modelsConfig.get"]();
-  assert.equal(stored.providers.openai.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(stored.config.providers.openai.baseUrl, "https://proxy.example.com/v1");
   // The enabled-model filter must NOT be persisted inside models.json — pi's CLI
   // rejects `enabledModels` in provider entries. It lives in the agent settings
   // file under pi's native `enabledModels` key (which the pi CLI reads itself).
-  assert.equal(stored.providers.openai.enabledModels, undefined);
+  assert.equal(stored.config.providers.openai.enabledModels, undefined);
   const agentSettings = JSON.parse(readFileSync(settingsPath, "utf8"));
   assert.ok(
     agentSettings.enabledModels.includes(`openai/${firstModel.id}`),
@@ -422,7 +553,7 @@ test("built-in provider overlays persist, restore defaults, and filter the model
   // Clearing Base URL + enabled models removes the overlay entirely.
   await handlers["modelsConfig.setProviderOverlay"]({ providerId: "openai", baseUrl: "", enabledModels: null });
   const cleared = await handlers["modelsConfig.get"]();
-  assert.equal(cleared.providers.openai, undefined);
+  assert.equal(cleared.config.providers.openai, undefined);
   const listedRestored = await handlers["models.list"]({ cwd: root });
   assert.ok(listedRestored.models.filter((m) => m.provider === "openai").length > 0);
   const settingsCleared = JSON.parse(readFileSync(settingsPath, "utf8"));
@@ -463,7 +594,7 @@ test("legacy enabledModels in models.json migrate into the agent settings file",
   rmSync(settingsPath, { force: true });
 
   const stored = await handlers["modelsConfig.get"]();
-  assert.equal(stored.providers.openai, undefined);
+  assert.equal(stored.config.providers.openai, undefined);
   const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
   assert.ok(settings.enabledModels.includes("openai/gpt-4o"));
   assert.ok(settings.enabledModels.includes("openai/gpt-4o-mini"));
@@ -474,10 +605,15 @@ test("legacy enabledModels in models.json migrate into the agent settings file",
   const legacySnapshot = {
     providers: { openai: { baseUrl: "https://proxy.example.com/v1", enabledModels: ["gpt-4o"] } },
   };
-  assert.deepEqual(await handlers["modelsConfig.set"](legacySnapshot), { ok: true });
+  const beforeLegacySave = await handlers["modelsConfig.get"]();
+  const legacySave = await handlers["modelsConfig.set"]({
+    config: legacySnapshot,
+    expectedVersion: beforeLegacySave.version,
+  });
+  assert.equal(legacySave.ok, true);
   const storedAfterSet = await handlers["modelsConfig.get"]();
-  assert.equal(storedAfterSet.providers.openai.baseUrl, "https://proxy.example.com/v1");
-  assert.equal(storedAfterSet.providers.openai.enabledModels, undefined);
+  assert.equal(storedAfterSet.config.providers.openai.baseUrl, "https://proxy.example.com/v1");
+  assert.equal(storedAfterSet.config.providers.openai.enabledModels, undefined);
   const settingsAfterSet = JSON.parse(readFileSync(settingsPath, "utf8"));
   assert.ok(settingsAfterSet.enabledModels.includes("openai/gpt-4o"));
 
@@ -799,6 +935,17 @@ test("sessions.get returns the contract shape without rescanning known session p
     listed.sessions.some((session) => session.id === sessionId),
     true,
   );
+  const filtered = await handlers["sessions.list"]({ cwd: path.join(root, ".") });
+  assert.equal(
+    filtered.sessions.some((session) => session.id === sessionId),
+    true,
+  );
+  const excluded = await handlers["sessions.list"]({ cwd: isolatedAgentDirectory });
+  assert.equal(
+    excluded.sessions.some((session) => session.id === sessionId),
+    false,
+  );
+  await assert.rejects(handlers["sessions.list"]({ cwd: "relative/project" }), (error) => error.code === "BAD_REQUEST");
 
   const originalListAll = SessionManager.listAll;
   SessionManager.listAll = async () => {

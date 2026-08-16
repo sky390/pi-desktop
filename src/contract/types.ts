@@ -124,7 +124,7 @@ export interface ModelInfo {
 
 export interface ModelCatalogWarning {
   provider: string;
-  code: "PROVIDER_REFRESH_FAILED" | "MODEL_REFRESH_TIMEOUT";
+  code: "PROVIDER_REFRESH_FAILED" | "PROVIDER_AVAILABILITY_FAILED" | "MODEL_REFRESH_TIMEOUT";
   message: string;
 }
 
@@ -144,8 +144,19 @@ export interface ModelsListResult {
   catalog: ModelCatalogStatus;
 }
 
+export interface ModelPreferencesResult {
+  models: ModelInfo[];
+  /** null means every available model is enabled, including models added later. */
+  enabledModels: string[] | null;
+}
+
 export interface ModelsConfig {
   [key: string]: unknown;
+}
+
+export interface ModelsConfigSnapshot {
+  config: ModelsConfig;
+  version: string;
 }
 
 export interface TestResult {

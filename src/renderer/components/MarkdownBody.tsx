@@ -1,11 +1,22 @@
-import { useEffect, useMemo, useState, type ImgHTMLAttributes, type MouseEvent, type ReactNode } from "react";
-import ReactMarkdown from "react-markdown";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ImgHTMLAttributes,
+  type JSX,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
 import { SyntaxHighlighter, vs, vscDarkPlus } from "@/lib/syntax-highlight";
 import { useTheme } from "@/hooks/useTheme";
-import { copyText } from "@/lib/clipboard";
+import { useCopyFeedback } from "@/hooks/useCopyFeedback";
 import { resolveLocalFileHref } from "@/lib/file-links";
 import { markdownRehypePlugins, markdownRemarkPlugins } from "@/lib/markdown";
 import { shouldHighlightCode } from "@/lib/code-highlight-policy";
+import { mermaidCacheKey, renderMermaidSvg } from "@/lib/mermaid-renderer";
 import { SessionProfiler } from "./SessionProfiler";
 
 interface MarkdownBodyProps {
@@ -18,6 +29,96 @@ interface MarkdownBodyProps {
   onOpenFile?: (filePath: string) => void;
 }
 
+type MarkdownRenderContextValue = Pick<
+  MarkdownBodyProps,
+  "isStreaming" | "cwd" | "imageBasePath" | "sourceSessionId" | "onOpenFile"
+>;
+
+const MarkdownRenderContext = createContext<MarkdownRenderContextValue>({});
+
+type MarkdownComponentProps<Tag extends keyof JSX.IntrinsicElements> = JSX.IntrinsicElements[Tag] & {
+  node?: unknown;
+};
+
+function MarkdownCode({ className, children, node: _node, ...props }: MarkdownComponentProps<"code">) {
+  const { isStreaming } = useContext(MarkdownRenderContext);
+  const lang = className?.replace("language-", "").toLowerCase() ?? "";
+  const raw = String(children);
+  const isBlock = className?.includes("language-") || raw.includes("\n");
+  if (isBlock) {
+    if (lang === "mermaid") {
+      return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={isStreaming} />;
+    }
+    return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
+  }
+  return (
+    <code className="markdown-inline-code" {...props}>
+      {children}
+    </code>
+  );
+}
+
+function MarkdownPre({ children }: MarkdownComponentProps<"pre">) {
+  return <>{children}</>;
+}
+
+function MarkdownAnchor({ href, children, node: _node, ...props }: MarkdownComponentProps<"a">) {
+  const { cwd, onOpenFile } = useContext(MarkdownRenderContext);
+  const filePath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
+  if (!filePath || !onOpenFile) {
+    return (
+      <a href={href} {...props}>
+        {children}
+      </a>
+    );
+  }
+
+  const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    const target = event.currentTarget.getAttribute("target");
+    if (target && target !== "_self") return;
+    event.preventDefault();
+    onOpenFile(filePath);
+  };
+
+  return (
+    <a href={href} {...props} onClick={handleClick}>
+      {children}
+    </a>
+  );
+}
+
+function MarkdownImg({ src, alt, node: _node, ...props }: MarkdownComponentProps<"img">) {
+  const { cwd, imageBasePath, sourceSessionId } = useContext(MarkdownRenderContext);
+  return (
+    <MarkdownImage
+      src={src}
+      alt={alt}
+      cwd={cwd}
+      relativeBase={imageBasePath ?? cwd}
+      sourceSessionId={sourceSessionId}
+      {...props}
+    />
+  );
+}
+
+function MarkdownTable({ children }: MarkdownComponentProps<"table">) {
+  return (
+    <div className="markdown-table-wrap">
+      <table>{children}</table>
+    </div>
+  );
+}
+
+const markdownComponents: Components = {
+  code: MarkdownCode,
+  pre: MarkdownPre,
+  a: MarkdownAnchor,
+  img: MarkdownImg,
+  table: MarkdownTable,
+};
+
 export function MarkdownBody({
   children,
   className,
@@ -28,85 +129,30 @@ export function MarkdownBody({
   onOpenFile,
 }: MarkdownBodyProps) {
   const normalizedMarkdown = useMemo(() => normalizeDisplayMath(children), [children]);
+  const renderContext = useMemo(
+    () => ({ isStreaming, cwd, imageBasePath, sourceSessionId, onOpenFile }),
+    [cwd, imageBasePath, isStreaming, onOpenFile, sourceSessionId],
+  );
 
   return (
     <SessionProfiler id="MarkdownBody">
-      <div className={["markdown-body", className].filter(Boolean).join(" ")}>
-        <ReactMarkdown
-          remarkPlugins={markdownRemarkPlugins}
-          rehypePlugins={markdownRehypePlugins}
-          components={{
-            code({ className, children, ...props }) {
-              const lang = className?.replace("language-", "").toLowerCase() ?? "";
-              const raw = String(children);
-              const isBlock = className?.includes("language-") || raw.includes("\n");
-              if (isBlock) {
-                if (lang === "mermaid") {
-                  return <MermaidBlock code={raw.replace(/\n$/, "")} isStreaming={isStreaming} />;
-                }
-                return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
-              }
-              return (
-                <code className="markdown-inline-code" {...props}>
-                  {children}
-                </code>
-              );
-            },
-            pre({ children }) {
-              return <>{children}</>;
-            },
-            a({ href, children, ...props }) {
-              const filePath = onOpenFile ? resolveLocalFileHref(href, cwd) : null;
-              const openFile = onOpenFile;
-              if (!filePath || !openFile) {
-                return (
-                  <a href={href} {...props}>
-                    {children}
-                  </a>
-                );
-              }
-
-              const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-                if (event.defaultPrevented || event.button !== 0) return;
-                if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-                const target = event.currentTarget.getAttribute("target");
-                if (target && target !== "_self") return;
-                event.preventDefault();
-                openFile(filePath);
-              };
-
-              return (
-                <a href={href} {...props} onClick={handleClick}>
-                  {children}
-                </a>
-              );
-            },
-            img({ src, alt, node: _node, ...props }) {
-              return (
-                <MarkdownImage
-                  src={src}
-                  alt={alt}
-                  cwd={cwd}
-                  relativeBase={imageBasePath ?? cwd}
-                  sourceSessionId={sourceSessionId}
-                  {...props}
-                />
-              );
-            },
-            table({ children }) {
-              return (
-                <div className="markdown-table-wrap">
-                  <table>{children}</table>
-                </div>
-              );
-            },
-          }}
-        >
-          {normalizedMarkdown}
-        </ReactMarkdown>
-      </div>
+      <MarkdownRenderContext.Provider value={renderContext}>
+        <div className={["markdown-body", className].filter(Boolean).join(" ")}>
+          <ReactMarkdown
+            remarkPlugins={markdownRemarkPlugins}
+            rehypePlugins={markdownRehypePlugins}
+            components={markdownComponents}
+          >
+            {normalizedMarkdown}
+          </ReactMarkdown>
+        </div>
+      </MarkdownRenderContext.Provider>
     </SessionProfiler>
   );
+}
+
+export function getMarkdownComponentIdentityForTest(): Components {
+  return markdownComponents;
 }
 
 function MarkdownImage({
@@ -210,7 +256,7 @@ function MermaidBlock({ code, isStreaming }: { code: string; isStreaming?: boole
   const [svg, setSvg] = useState<string | null>(null);
   const [renderedKey, setRenderedKey] = useState("");
   const [failedKey, setFailedKey] = useState<string | null>(null);
-  const currentKey = `${isDark ? "dark" : "light"}\n${code}`;
+  const currentKey = mermaidCacheKey(code, isDark);
 
   useEffect(() => {
     if (!showPreview || isStreaming) return;
@@ -219,24 +265,9 @@ function MermaidBlock({ code, isStreaming }: { code: string; isStreaming?: boole
     setFailedKey(null);
 
     const render = async () => {
-      const { default: mermaid } = await import("mermaid");
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: "strict",
-        suppressErrorRendering: true,
-        theme: isDark ? "dark" : "default",
-      });
-
-      const parsed = await mermaid.parse(code, { suppressErrors: true });
-      if (!parsed) throw new Error("Invalid Mermaid diagram");
-
-      const id =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? `mermaid-${crypto.randomUUID()}`
-          : `mermaid-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const result = await mermaid.render(id, code);
+      const rendered = await renderMermaidSvg(code, isDark);
       if (!cancelled) {
-        setSvg(result.svg);
+        setSvg(rendered);
         setRenderedKey(currentKey);
       }
     };
@@ -293,14 +324,7 @@ function MermaidBlock({ code, isStreaming }: { code: string; isStreaming?: boole
 
 function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; headerAction?: ReactNode }) {
   const { isDark } = useTheme();
-  const [copied, setCopied] = useState(false);
-
-  const copy = () => {
-    void copyText(code).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
-  };
+  const { copied, copy } = useCopyFeedback();
 
   return (
     <div className="markdown-code-block">
@@ -308,7 +332,7 @@ function CodeBlock({ code, lang, headerAction }: { code: string; lang: string; h
         <span className="markdown-code-lang">{lang || "text"}</span>
         <div className="markdown-code-actions">
           {headerAction}
-          <button onClick={copy} className="markdown-code-action">
+          <button onClick={() => void copy(code)} className="markdown-code-action">
             {copied ? "copied" : "copy"}
           </button>
         </div>

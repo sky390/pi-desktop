@@ -21,6 +21,7 @@ import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { homedir, tmpdir } from "os";
 import { applyProxyEnvVars, configureProxyDispatcher } from "./proxy-config";
 import path from "path";
+import { createHash, randomUUID } from "crypto";
 import {
   DefaultResourceLoader,
   CredentialSynchronizationError,
@@ -28,7 +29,6 @@ import {
   SessionManager,
   createAgentSessionServices,
   getAgentDir,
-  parseFrontmatter,
   type SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { getSupportedThinkingLevels, type AuthInteraction } from "@earendil-works/pi-ai";
@@ -50,15 +50,17 @@ import {
   type BuiltinModelInfo,
   type HistoryWindow,
   type ModelCatalogStatus,
-  type ModelsListResult,
+  type ModelCatalogWarning,
+  ModelsListResult,
   type SessionDetail,
   type SessionRuntimeState,
 } from "../contract/types";
 import type { SessionTreeNode } from "../shared/types";
-import { allowFileRoot, getAllowedFileRoots, invalidateAllowedRootsCache, isFilePathAllowed } from "./file-access";
+import { allowFileRoot, getAllowedFileRoots, isFilePathAllowed } from "./file-access";
 import {
   activateSession,
   forceRunningChange,
+  disposeAllRpcSessions,
   getRpcSession,
   getRunningRpcSessionIds,
   startRpcSession,
@@ -90,6 +92,7 @@ import {
 import { buildEntriesFromFiles, filterFileEntries } from "../shared/file-fuzzy";
 import {
   DOCX_PREVIEW_MAX_BYTES,
+  FILE_DOWNLOAD_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
   TEXT_PREVIEW_MAX_BYTES,
   documentPreviewKind,
@@ -97,14 +100,16 @@ import {
   getDocumentMime,
   getImageMime,
 } from "../shared/file-types";
-import { createFileWatchService } from "./file-watch";
+import { createFileWatchService, stopAllFileWatches } from "./file-watch";
 import { callMain } from "./parent-rpc";
 import { createAuthLoginService, resolveLoginCode } from "./auth-login";
 import { getSharedModelRuntime, modelCatalogRefreshCoordinator, reloadSharedModelRuntimeConfig } from "./model-runtime";
 import { applyPluginAction, readPlugins } from "./plugins-service";
 import { installSkill, searchSkills } from "./skills-service";
+import { updateSkillModelInvocation } from "./skill-frontmatter";
 import { projectSessionTreeForResponse } from "./project-tree";
 import { ChannelManager } from "./channels/channel-manager";
+import { safeChannelError } from "./channels/redaction";
 import { ToolchainError } from "../shared/toolchains/errors";
 import { toolchainRuntime } from "./toolchain-runtime";
 import {
@@ -509,17 +514,59 @@ function readModelsJson(): Record<string, unknown> {
   }
 }
 
-function writeModelsJson(data: Record<string, unknown>): void {
+type ModelsFileSnapshot = { raw: string | null; version: string };
+
+function modelsContentVersion(raw: string | null): string {
+  return raw === null ? "missing" : `sha256:${createHash("sha256").update(raw, "utf8").digest("hex")}`;
+}
+
+function readModelsFileSnapshot(): ModelsFileSnapshot {
+  const p = getModelsPath();
+  if (!existsSync(p)) return { raw: null, version: modelsContentVersion(null) };
+  const raw = readFileSync(p, "utf8");
+  return { raw, version: modelsContentVersion(raw) };
+}
+
+function readModelsJsonSnapshot(): { config: Record<string, unknown>; version: string } {
+  const snapshot = readModelsFileSnapshot();
+  if (snapshot.raw === null) return { config: { providers: {} }, version: snapshot.version };
+  try {
+    return { config: JSON.parse(snapshot.raw) as Record<string, unknown>, version: snapshot.version };
+  } catch (e) {
+    // ISSUE-009: never silently return empty and allow overwrite of corrupt file
+    throw new RpcError({
+      code: "PARSE_ERROR",
+      message: `Failed to parse models.json: ${e instanceof Error ? e.message : String(e)}`,
+    });
+  }
+}
+
+function modelsConfigConflict(expectedVersion: string, currentVersion: string): RpcError {
+  return new RpcError({
+    code: "CONFLICT",
+    message: "models.json changed outside this editor; current edits were not saved",
+    detail: { expectedVersion, currentVersion },
+  });
+}
+
+function writeModelsJson(data: Record<string, unknown>, expectedVersion?: string): string {
   const p = getModelsPath();
   mkdirSync(path.dirname(p), { recursive: true });
+  // Compare-and-swap: refuse to overwrite when the file changed since the
+  // editor's snapshot (another editor/session may have saved meanwhile).
+  if (expectedVersion !== undefined) {
+    const initial = readModelsFileSnapshot();
+    if (initial.version !== expectedVersion) throw modelsConfigConflict(expectedVersion, initial.version);
+  }
+  const serialized = JSON.stringify(data, null, 2);
   // ISSUE-009: atomic write via temp + rename; keep .bak of previous good file
   const tmp = `${p}.${process.pid}.tmp`;
   const bak = `${p}.bak`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2), "utf8");
+  writeFileSync(tmp, serialized, "utf8");
   try {
     if (existsSync(p)) {
       try {
-        writeFileSync(bak, readFileSync(p));
+        writeFileSync(bak, readFileSync(p), "utf8");
       } catch {
         /* ignore bak failure */
       }
@@ -533,6 +580,7 @@ function writeModelsJson(data: Record<string, unknown>): void {
     }
     throw e;
   }
+  return modelsContentVersion(serialized);
 }
 
 // ── Enabled-model filters (agent `enabledModels` + desktop map, NOT models.json) ──
@@ -987,12 +1035,86 @@ function resolveModelsCwd(params: { cwd?: string } | void): string {
   return cwd;
 }
 
-async function projectModelsList(
+type DirectoryValidation = { ok: true; path: string; canonicalPath: string } | { ok: false; error: string };
+
+function validateExistingDirectory(candidate: unknown): DirectoryValidation {
+  if (typeof candidate !== "string" || !candidate) return { ok: false, error: "Directory does not exist" };
+  try {
+    const realpath = realpathSync.native ?? realpathSync;
+    const canonicalPath = realpath(candidate);
+    if (!statSync(canonicalPath).isDirectory()) return { ok: false, error: "Not a directory" };
+    return { ok: true, path: candidate, canonicalPath };
+  } catch {
+    return { ok: false, error: "Directory does not exist" };
+  }
+}
+
+function canonicalPathForComparison(candidate: string): string {
+  const resolved = path.resolve(candidate);
+  let canonical = resolved;
+  try {
+    const realpath = realpathSync.native ?? realpathSync;
+    canonical = realpath(resolved);
+  } catch {
+    // Historical session cwd values can refer to directories that no longer exist.
+  }
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+type AvailableModel = Awaited<ReturnType<ModelRuntime["getAvailable"]>>[number];
+
+async function resolveAvailableModels(
+  modelRuntime: ModelRuntime,
+  signal?: AbortSignal,
+): Promise<{ models: AvailableModel[]; warnings: ModelCatalogWarning[] }> {
+  const snapshot = [...modelRuntime.getAvailableSnapshot()];
+  const snapshotByProvider = new Map<string, AvailableModel[]>();
+  for (const model of snapshot) {
+    const models = snapshotByProvider.get(model.provider) ?? [];
+    models.push(model);
+    snapshotByProvider.set(model.provider, models);
+  }
+
+  const results = await Promise.all(
+    [...modelRuntime.getProviders()]
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map(async (provider) => {
+        try {
+          const models = [...(await modelRuntime.getAvailable(provider.id, { signal }))];
+          return { models, warning: undefined };
+        } catch (error) {
+          if (signal?.aborted) throw signal.reason ?? error;
+          return {
+            models: snapshotByProvider.get(provider.id) ?? [],
+            warning: {
+              provider: provider.id,
+              code: "PROVIDER_AVAILABILITY_FAILED" as const,
+              message: `Unable to check ${provider.id} model availability; the last known state remains available.`,
+            },
+          };
+        }
+      }),
+  );
+  signal?.throwIfAborted();
+  return {
+    models: results.flatMap((result) => result.models),
+    warnings: results.flatMap((result) => (result.warning ? [result.warning] : [])),
+  };
+}
+
+export async function projectModelsList(
   modelRuntime: ModelRuntime,
   settings: SettingsManager,
   catalog: ModelCatalogStatus,
+  options: { signal?: AbortSignal; cachedOnly?: boolean } = {},
 ): Promise<ModelsListResult> {
-  const available = [...(await modelRuntime.getAvailable())];
+  // Per-provider availability with graceful degradation: a provider that fails
+  // its live check keeps its last known snapshot models instead of failing the
+  // whole list, and the warning is surfaced to the UI (PROVIDER_AVAILABILITY_FAILED).
+  const availability = options.cachedOnly
+    ? { models: [...modelRuntime.getAvailableSnapshot()], warnings: [] }
+    : await resolveAvailableModels(modelRuntime, options.signal);
+  const available = availability.models;
   // Lift any `enabledModels` left in models.json by older desktop versions into
   // the agent settings file; a corrupt models.json is left untouched (see ISSUE-009).
   await migrateLegacyEnabledModels();
@@ -1027,7 +1149,30 @@ async function projectModelsList(
     defaultModel = { provider, modelId };
   }
 
-  return { models, defaultModel, thinkingLevels, thinkingLevelMaps, nameMap, catalog };
+  return {
+    models,
+    defaultModel,
+    thinkingLevels,
+    thinkingLevelMaps,
+    nameMap,
+    catalog: {
+      ...catalog,
+      warnings: [...(catalog.warnings ?? []), ...availability.warnings],
+    },
+  };
+}
+
+export function initializeChannels(
+  manager: Pick<ChannelManager, "initialize">,
+  report: (message: string) => void = (message) => {
+    try {
+      process.parentPort?.postMessage({ type: "log", message: `[channels] initialization failed: ${message}` });
+    } catch {
+      /* ignore logging failure */
+    }
+  },
+): void {
+  void manager.initialize().catch((error) => report(safeChannelError(error)));
 }
 
 export function registerHandlers(server: RpcServer): () => Promise<void> {
@@ -1036,7 +1181,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
   const channelManager = new ChannelManager(server, (session, sessionId) =>
     ensureSessionEvents(server, session, sessionId),
   );
-  void channelManager.initialize();
+  initializeChannels(channelManager);
 
   // Running sessions stream + tray badge signal to main via parentPort
   subscribeRunningSessions((ids) => {
@@ -1138,11 +1283,19 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       };
     },
 
-    "sessions.list": async () => {
+    "sessions.list": async (params) => {
       const traceId = resolveSessionTraceId();
       const startedAt = performance.now();
       try {
-        const sessions = await listAllSessions();
+        const requestedCwd = (params as { cwd?: unknown } | undefined)?.cwd;
+        if (requestedCwd !== undefined && (typeof requestedCwd !== "string" || !path.isAbsolute(requestedCwd))) {
+          throw new RpcError({ code: "BAD_REQUEST", message: "absolute cwd required" });
+        }
+        const canonicalCwd = typeof requestedCwd === "string" ? canonicalPathForComparison(requestedCwd) : undefined;
+        const allSessions = await listAllSessions();
+        const sessions = canonicalCwd
+          ? allSessions.filter((session) => canonicalPathForComparison(session.cwd) === canonicalCwd)
+          : allSessions;
         const indexMetrics = getSessionIndexMetrics();
         logSessionPerformance("sessions.list", {
           traceId,
@@ -1481,7 +1634,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         throw new RpcError({ code: "BAD_REQUEST", message: `Directory does not exist: ${cwd}` });
       }
 
-      const tempKey = `__new__${Date.now()}`;
+      const tempKey = createAgentNewLockKey();
       const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, toolNames, { activate: true });
       allowFileRoot(cwd);
 
@@ -1693,6 +1846,13 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       if (!st.isFile()) {
         throw new RpcError({ code: "BAD_REQUEST", message: "Not a file" });
       }
+      if (st.size > FILE_DOWNLOAD_MAX_BYTES) {
+        throw new RpcError({
+          code: "RESULT_TOO_LARGE",
+          message: `File exceeds the ${FILE_DOWNLOAD_MAX_BYTES / 1024 / 1024} MiB download limit`,
+          detail: { size: st.size, maxBytes: FILE_DOWNLOAD_MAX_BYTES },
+        });
+      }
       return {
         base64: readFileSync(filePath).toString("base64"),
         size: st.size,
@@ -1769,12 +1929,12 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       const { root, query } = params as { root: string; query?: string };
       await assertPathAllowed(root);
       let relFiles: string[] = [];
-      let hardTruncated = false;
+      let truncatedReason: "depth" | "count" | undefined;
 
       try {
         const all = await listGitFiles(root);
         if (all.length > 50_000) {
-          hardTruncated = true;
+          truncatedReason = "count";
           relFiles = all.slice(0, 50_000);
         } else {
           relFiles = all;
@@ -1782,8 +1942,12 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       } catch {
         const abs: string[] = [];
         const walk = (dir: string, depth: number) => {
-          if (depth > 8 || abs.length >= 5000) {
-            if (abs.length >= 5000) hardTruncated = true;
+          if (depth > 8) {
+            truncatedReason ??= "depth";
+            return;
+          }
+          if (abs.length >= 5000) {
+            truncatedReason = "count";
             return;
           }
           let names: string[];
@@ -1803,7 +1967,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
               /* skip */
             }
             if (abs.length >= 5000) {
-              hardTruncated = true;
+              truncatedReason = "count";
               return;
             }
           }
@@ -1818,7 +1982,8 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
 
       const CLIENT_CAP = 5000;
       const filesForClient = relFiles.slice(0, CLIENT_CAP);
-      const truncated = hardTruncated || relFiles.length > CLIENT_CAP;
+      if (relFiles.length > CLIENT_CAP) truncatedReason = "count";
+      const truncated = truncatedReason !== undefined;
       const entries = buildEntriesFromFiles(filesForClient);
 
       if (query?.trim()) {
@@ -1826,6 +1991,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         return {
           files: filesForClient,
           truncated,
+          ...(truncatedReason ? { truncatedReason } : {}),
           matches: matches.map((m) => ({
             path: m.path,
             isDir: m.isDir,
@@ -1837,6 +2003,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       return {
         files: filesForClient,
         truncated,
+        ...(truncatedReason ? { truncatedReason } : {}),
         matches: entries.slice(0, 100).map((m) => ({
           path: m.path,
           isDir: m.isDir,
@@ -1864,10 +2031,16 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       }
       const cwd = resolveModelsCwd(params);
       const agentDir = getAgentDir();
-      const { services, catalog } = await modelCatalogRefreshCoordinator.refresh(cwd, requestId, (signal) =>
-        createAgentSessionServices({ cwd, agentDir, modelRuntimeSignal: signal }),
+      return modelCatalogRefreshCoordinator.refresh(
+        cwd,
+        requestId,
+        (signal) => createAgentSessionServices({ cwd, agentDir, modelRuntimeSignal: signal }),
+        ({ services, catalog }, signal) =>
+          projectModelsList(services.modelRuntime, services.settingsManager, catalog, {
+            signal,
+            cachedOnly: catalog.aborted,
+          }),
       );
-      return projectModelsList(services.modelRuntime, services.settingsManager, catalog);
     },
 
     "models.refreshCancel": (params) => {
@@ -1879,18 +2052,23 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       // Lift legacy `providers.<id>.enabledModels` out of models.json so the
       // editor snapshot never re-saves the desktop-only field into pi's config.
       await migrateLegacyEnabledModels();
-      return readModelsJson() as never;
+      return readModelsJsonSnapshot() as never;
     },
+
     "modelsConfig.set": async (params) => {
-      const body = params as Record<string, unknown>;
+      const body = params as { config?: unknown; expectedVersion?: unknown };
+      const config = body?.config as Record<string, unknown> | undefined;
       // ISSUE-009: refuse to persist empty overwrite without explicit providers key from a real load
-      if (!body || typeof body !== "object" || !("providers" in body)) {
+      if (!config || typeof config !== "object" || !("providers" in config)) {
         throw new RpcError({ code: "BAD_REQUEST", message: "Invalid models config payload" });
+      }
+      if (typeof body.expectedVersion !== "string" || !body.expectedVersion) {
+        throw new RpcError({ code: "BAD_REQUEST", message: "expectedVersion is required" });
       }
       await migrateLegacyEnabledModels();
       // A full-config save must never write the enabled-model filter into
       // models.json; lift any leftovers into the agent settings file instead.
-      const providers = (body.providers ?? {}) as Record<string, Record<string, unknown>>;
+      const providers = (config.providers ?? {}) as Record<string, Record<string, unknown>>;
       let filtersChanged = false;
       const filters = readProviderModelFilters(buildModelsByProvider());
       for (const [providerId, entry] of Object.entries(providers)) {
@@ -1906,13 +2084,14 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         if (Object.keys(entry).length === 0) delete providers[providerId];
         filtersChanged = true;
       }
-      // Persist models.json first, then reload the runtime so resolvable
-      // provider ids reflect the newly saved config (e.g. a provider the user
-      // just gave an apiKey), then write the mirror restricted to those.
-      writeModelsJson(body);
+      // Persist models.json first (CAS against the editor's snapshot), then
+      // reload the runtime so resolvable provider ids reflect the newly saved
+      // config (e.g. a provider the user just gave an apiKey), then write the
+      // mirror restricted to those.
+      const version = writeModelsJson(config, body.expectedVersion);
       await reloadSharedModelRuntimeConfig();
       if (filtersChanged) writeProviderModelFilters(filters, await resolvableProviderIds());
-      return { ok: true as const };
+      return { ok: true as const, version };
     },
     "networkProxy.get": () => {
       const settings = readSettingsJson();
@@ -2407,10 +2586,7 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
         token: string;
         code: string;
       };
-      if (!token.startsWith(`${provider}-`)) {
-        throw new RpcError({ code: "BAD_REQUEST", message: "Token does not match provider" });
-      }
-      if (!resolveLoginCode(token, code)) {
+      if (!resolveLoginCode(provider, token, code)) {
         throw new RpcError({ code: "NOT_FOUND", message: "No pending login for token" });
       }
       return { ok: true as const };
@@ -2475,16 +2651,10 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       if (content.length > 2 * 1024 * 1024) {
         throw new RpcError({ code: "BAD_REQUEST", message: "Skill file is too large" });
       }
-      const key = "disable-model-invocation";
-      const { frontmatter } = parseFrontmatter<Record<string, unknown>>(content);
-      const alreadySet = Boolean(frontmatter[key]);
-      let updated = content;
-      if (body.disableModelInvocation === true && !alreadySet) {
-        updated = content.replace(/^---\r?\n/, `---\n${key}: true\n`);
-        if (updated === content) updated = `---\n${key}: true\n---\n${content}`;
-      } else if (body.disableModelInvocation === false && alreadySet) {
-        updated = content.replace(new RegExp(`^${key}\\s*:.*\\r?\\n`, "m"), "");
-      }
+      const updated =
+        body.disableModelInvocation === undefined
+          ? content
+          : updateSkillModelInvocation(content, body.disableModelInvocation);
       writeTextAtomically(filePath, updated);
       return { ok: true as const };
     },
@@ -2505,18 +2675,22 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       return applyPluginAction(params);
     },
 
-    "files.watchStart": async (params) => {
+    "files.watchStart": async (params, context) => {
       const { path: filePath, sourceSessionId } = params as {
         path: string;
         sourceSessionId?: string;
       };
-      await fileWatch.start(filePath, sourceSessionId);
+      const leaseKey = `files.watch:${filePath}`;
+      context?.releaseLease(leaseKey);
+      const release = await fileWatch.start(filePath, sourceSessionId);
+      context?.setLease(leaseKey, release);
       return { ok: true as const };
     },
 
-    "files.watchStop": async (params) => {
+    "files.watchStop": async (params, context) => {
       const { path: filePath } = params as { path: string };
-      fileWatch.stop(filePath);
+      if (context) context.releaseLease(`files.watch:${filePath}`);
+      else fileWatch.stop(filePath);
       return { ok: true as const };
     },
 
@@ -2524,15 +2698,10 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
 
     "system.validateCwd": async (params) => {
       const { path: dir } = params as { path: string };
-      try {
-        const st = statSync(dir);
-        if (!st.isDirectory()) return { ok: false, error: "Not a directory" };
-        allowFileRoot(dir);
-        invalidateAllowedRootsCache();
-        return { ok: true, path: dir };
-      } catch {
-        return { ok: false, error: "Directory does not exist" };
-      }
+      const validation = validateExistingDirectory(dir);
+      if (!validation.ok) return validation;
+      allowFileRoot(validation.canonicalPath);
+      return { ok: true as const, path: validation.path };
     },
 
     "system.defaultCwd": async () => {
@@ -2540,14 +2709,14 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
       const dir = path.join(homedir(), `pi-cwd-${date}`);
       mkdirSync(dir, { recursive: true });
       allowFileRoot(dir);
-      invalidateAllowedRootsCache();
       return { cwd: dir };
     },
 
     "system.allowRoot": async (params) => {
       const { path: dir } = params as { path: string };
-      allowFileRoot(dir);
-      invalidateAllowedRootsCache();
+      const validation = validateExistingDirectory(dir);
+      if (!validation.ok) throw new RpcError({ code: "BAD_REQUEST", message: validation.error });
+      allowFileRoot(validation.canonicalPath);
       return { ok: true as const };
     },
 
@@ -2560,7 +2729,13 @@ export function registerHandlers(server: RpcServer): () => Promise<void> {
   return async () => {
     modelCatalogRefreshCoordinator.cancelAll();
     await channelManager.shutdown();
+    stopAllFileWatches();
+    await disposeAllRpcSessions();
   };
+}
+
+export function createAgentNewLockKey(): string {
+  return `__new__${randomUUID()}`;
 }
 
 /** ISSUE-003: track bindings per wrapper instance, not permanent sessionId set */
@@ -2584,7 +2759,7 @@ function ensureSessionEvents(
   session: {
     sessionId: string;
     onEvent: (l: (e: { type: string; [k: string]: unknown }) => void) => () => void;
-    onDestroy?: (cb: () => void) => void;
+    onDestroy?: (cb: () => void) => void | (() => void);
   },
   sessionId: string,
 ): void {

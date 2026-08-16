@@ -2,7 +2,7 @@ import { execFile } from "child_process";
 import { existsSync, mkdirSync, realpathSync } from "fs";
 import { basename, dirname, join, normalize, resolve } from "path";
 import { promisify } from "util";
-import { allowFileRoot } from "./allowed-roots.ts";
+import { allowFileRoot, normalizeSlashes } from "./allowed-roots.ts";
 import type { GitStatusResult } from "./api-types";
 import { parseGitStatusPorcelain } from "./git-status.ts";
 export { parseGitStatusPorcelain } from "./git-status.ts";
@@ -16,13 +16,6 @@ const execFileAsync = promisify(execFile);
  */
 function normalizeGitPath(filePath: string): string {
   return normalize(filePath);
-}
-
-/** Compare absolute paths robustly (case- and separator-insensitive on Windows). */
-function samePath(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (process.platform !== "win32") return false;
-  return resolve(a).toLowerCase() === resolve(b).toLowerCase();
 }
 
 export interface GitCommandRunOptions {
@@ -99,6 +92,19 @@ export function invalidateProjectCache(): void {
 
 export function getProjectCacheRevision(): number {
   return projectCacheRevision;
+}
+
+export function normalizeWorktreePathForComparison(
+  filePath: string,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  let normalized = normalizeSlashes(filePath.trim());
+  if (normalized.length > 1 && !/^[A-Za-z]:\/$/.test(normalized)) normalized = normalized.replace(/\/+$/, "");
+  return platform === "win32" ? normalized.toLocaleLowerCase("en-US") : normalized;
+}
+
+export function worktreePathsEqual(left: string, right: string, platform: NodeJS.Platform = process.platform): boolean {
+  return normalizeWorktreePathForComparison(left, platform) === normalizeWorktreePathForComparison(right, platform);
 }
 
 async function git(cwd: string, args: string[]): Promise<string> {
@@ -204,8 +210,10 @@ export async function resolveProject(cwd: string): Promise<ProjectInfo> {
     // cwd is a subdirectory of a repo keeps its own project identity —
     // grouping subdirs under the repo root would change where new sessions
     // are created for existing users.
-    const isTopLevel = samePath(toplevel, realCwd);
-    const isWorktreeTopLevel = gitDir !== commonDir && isTopLevel;
+
+    const isTopLevel = worktreePathsEqual(toplevel, realCwd);
+    const isWorktreeTopLevel = !worktreePathsEqual(gitDir, commonDir) && isTopLevel;
+
     info = {
       projectRoot: isWorktreeTopLevel ? normalizeGitPath(dirname(commonDir)) : cwd,
       branch: ref && ref !== "HEAD" ? ref : null,
@@ -319,12 +327,14 @@ export async function addWorktree(cwd: string, branch: string): Promise<{ path: 
 
 export async function removeWorktree(cwd: string, worktreePath: string, force = false): Promise<void> {
   const worktrees = await listWorktrees(cwd);
-  const target = worktrees.find((w) => samePath(w.path, worktreePath));
+
+  const target = worktrees.find((w) => worktreePathsEqual(w.path, worktreePath));
+
   if (!target) throw new Error(`Not a worktree of this repository: ${worktreePath}`);
   if (target.isMain) throw new Error("Cannot remove the main worktree");
 
   try {
-    await git(cwd, ["worktree", "remove", ...(force ? ["--force"] : []), worktreePath]);
+    await git(cwd, ["worktree", "remove", ...(force ? ["--force"] : []), target.path]);
   } catch (error) {
     throw new Error(extractGitError(error));
   }

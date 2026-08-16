@@ -1,27 +1,15 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
-import { mkdirSync } from "node:fs";
-import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
-
-const output = path.join(import.meta.dirname, "../../.artifacts/test-modules", `session-reader-${process.pid}.mjs`);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
+const { buildSessionContext } = await importTestBundle("src/agent-host/session-reader", {
+  packages: "external",
   stdin: {
     contents: 'export { buildSessionContext } from "./session-reader.ts";',
     resolveDir: import.meta.dirname,
     sourcefile: "session-reader-test-entry.ts",
     loader: "ts",
   },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
 });
-const { buildSessionContext } = await import(`${pathToFileURL(output).href}?v=${Date.now()}`);
 
 const timestamp = "2026-07-15T12:00:00.000Z";
 
@@ -33,7 +21,11 @@ test("hidden channel markers annotate UI user messages without entering displaye
       parentId: null,
       timestamp,
       customType: "pi-desktop-channel-source",
-      data: { channel: "telegram", runId: "run-one" },
+      data: {
+        channel: "telegram",
+        runId: "run-one",
+        attachments: [{ kind: "file", name: "report.pdf", mime: "application/pdf" }],
+      },
     },
     {
       type: "message",
@@ -48,6 +40,9 @@ test("hidden channel markers annotate UI user messages without entering displaye
   assert.equal(context.messages.length, 1);
   assert.equal(context.messages[0].role, "user");
   assert.equal(context.messages[0].channelSource, "telegram");
+  assert.deepEqual(context.messages[0].channelAttachments, [
+    { kind: "file", name: "report.pdf", mime: "application/pdf" },
+  ]);
   assert.deepEqual(context.messages[0].content, [{ type: "text", text: "hello" }]);
   assert.deepEqual(context.entryIds, ["user"]);
 });

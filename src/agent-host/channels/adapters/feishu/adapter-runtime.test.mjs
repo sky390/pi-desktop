@@ -1,21 +1,24 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
+import { createManualScheduler } from "#test-timing";
 
-const output = path.join(
-  import.meta.dirname,
-  "../../../../../.artifacts/test-modules",
-  `feishu-adapter-runtime-${process.pid}.mjs`,
-);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
+const {
+  ChannelStateStore,
+  FeishuAdapter,
+  FeishuApiError,
+  feishuReconnectDelay,
+  isFatalFeishuConnectionError,
+  normalizeFeishuEvent,
+  normalizeFeishuMenuEvent,
+} = await importTestBundle("src/agent-host/channels/adapters/feishu/adapter-runtime", {
+  packages: "external",
   stdin: {
     contents: [
-      'export { FeishuAdapter, normalizeFeishuEvent, normalizeFeishuMenuEvent } from "./adapter.ts";',
+      'export { FeishuAdapter, feishuReconnectDelay, isFatalFeishuConnectionError, normalizeFeishuEvent, normalizeFeishuMenuEvent } from "./adapter.ts";',
       'export { FeishuApiError } from "./api.ts";',
       'export { ChannelStateStore } from "../../state-store.ts";',
     ].join("\n"),
@@ -23,16 +26,7 @@ await build({
     sourcefile: "feishu-adapter-runtime-test-entry.ts",
     loader: "ts",
   },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
 });
-
-const { ChannelStateStore, FeishuAdapter, FeishuApiError, normalizeFeishuEvent, normalizeFeishuMenuEvent } =
-  await import(`${pathToFileURL(output).href}?v=${Date.now()}`);
 
 function account(overrides = {}) {
   const now = new Date().toISOString();
@@ -348,6 +342,92 @@ test("failed Channel Core handling does not persist the Feishu message as proces
   assert.equal(state.isProcessed("feishu-runtime", "om_retryable"), false);
 });
 
+test("recoverable terminal WebSocket errors rebuild the connection with bounded jitter", async () => {
+  const controller = new globalThis.AbortController();
+  const statuses = [];
+  const delays = [];
+  let connectCalls = 0;
+  let closeCalls = 0;
+  const adapter = new FeishuAdapter(
+    dependencies({
+      async connect(_credentials, _handlers, hooks) {
+        connectCalls += 1;
+        if (connectCalls === 1) {
+          globalThis.queueMicrotask(() => hooks.onError(new Error("WebSocket reconnect exhausted after 3 attempts")));
+        } else {
+          globalThis.queueMicrotask(() => controller.abort());
+        }
+        return { close: () => (closeCalls += 1) };
+      },
+    }),
+    undefined,
+    undefined,
+    {
+      random: () => 0,
+      sleep: async (ms) => delays.push(ms),
+    },
+  );
+
+  await adapter.start({
+    account: account(),
+    secret: { token: "app-secret", providerAccountId: "ou_bot", baseUrl: "https://open.feishu.cn" },
+    signal: controller.signal,
+    state: stateStore(),
+    onInbound: async () => undefined,
+    onStatus: (status) => statuses.push(status),
+    log: () => undefined,
+  });
+
+  assert.equal(connectCalls, 2);
+  assert.equal(closeCalls, 2);
+  assert.deepEqual(delays, [1_000]);
+  assert.equal(
+    statuses.some((status) => status.state === "reconnecting" && status.retryCount === 1),
+    true,
+  );
+  assert.equal(isFatalFeishuConnectionError(new Error("WebSocket reconnect exhausted after 3 attempts")), false);
+  assert.equal(feishuReconnectDelay(100, () => 0.999_999) <= 30_000, true);
+});
+
+test("credential and permission WebSocket errors remain terminal", async () => {
+  const statuses = [];
+  const delays = [];
+  let connectCalls = 0;
+  const adapter = new FeishuAdapter(
+    dependencies({
+      async connect(_credentials, _handlers, hooks) {
+        connectCalls += 1;
+        globalThis.queueMicrotask(() => hooks.onError(new Error("pullConnectConfig failed: invalid App Secret")));
+        return { close() {} };
+      },
+    }),
+    undefined,
+    undefined,
+    { sleep: async (ms) => delays.push(ms) },
+  );
+
+  await assert.rejects(
+    adapter.start({
+      account: account(),
+      secret: { token: "app-secret", providerAccountId: "ou_bot", baseUrl: "https://open.feishu.cn" },
+      signal: new globalThis.AbortController().signal,
+      state: stateStore(),
+      onInbound: async () => undefined,
+      onStatus: (status) => statuses.push(status),
+      log: () => undefined,
+    }),
+    /invalid App Secret/,
+  );
+
+  assert.equal(connectCalls, 1);
+  assert.deepEqual(delays, []);
+  assert.equal(
+    statuses.some((status) => status.state === "error"),
+    true,
+  );
+  assert.equal(isFatalFeishuConnectionError(new Error("permission denied for required scope")), true);
+});
+
 test("native Feishu menu dispatches existing commands and suppresses replay", async () => {
   const controller = new globalThis.AbortController();
   const state = stateStore();
@@ -488,6 +568,7 @@ test("progressive turns stream process and Markdown then fold details in the fin
   const finishes = [];
   const reactions = [];
   const removedReactions = [];
+  const scheduler = createManualScheduler();
   const adapter = new FeishuAdapter(
     dependencies({
       async startRichCard(_credentials, request) {
@@ -512,6 +593,8 @@ test("progressive turns stream process and Markdown then fold details in the fin
       },
     }),
     0,
+    undefined,
+    { turnTimers: scheduler },
   );
   const output = adapter.beginTurn({
     account: account(),
@@ -536,7 +619,7 @@ test("progressive turns stream process and Markdown then fold details in the fin
     },
   });
   output.update({ type: "tool_start", toolCallId: "tool-1", toolName: "read", args: { path: "README.md" } });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await scheduler.runNext();
   const result = await output.finish("## 最终答案\n\n- 支持 Markdown");
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -584,6 +667,7 @@ test("Feishu reaction failures never prevent a durable final reply", async () =>
 test("missing CardKit permission falls back to one durable Markdown card without losing the answer", async () => {
   const cards = [];
   const plain = [];
+  const scheduler = createManualScheduler();
   const adapter = new FeishuAdapter(
     dependencies({
       async startRichCard() {
@@ -599,6 +683,8 @@ test("missing CardKit permission falls back to one durable Markdown card without
       },
     }),
     0,
+    undefined,
+    { turnTimers: scheduler },
   );
   const output = adapter.beginTurn({
     account: account(),
@@ -608,7 +694,7 @@ test("missing CardKit permission falls back to one durable Markdown card without
     replyToMessageId: "om_source",
     runId: "om_source",
   });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await scheduler.runNext();
   const result = await output.finish("**即使没有 CardKit 权限也保留 Markdown**");
 
   assert.equal(cards.length, 1);
@@ -619,6 +705,7 @@ test("missing CardKit permission falls back to one durable Markdown card without
 
 test("a streaming update failure is isolated and the existing card still receives the final answer", async () => {
   const finishes = [];
+  const scheduler = createManualScheduler();
   const adapter = new FeishuAdapter(
     dependencies({
       async startRichCard() {
@@ -635,6 +722,8 @@ test("a streaming update failure is isolated and the existing card still receive
       },
     }),
     0,
+    undefined,
+    { turnTimers: scheduler },
   );
   const output = adapter.beginTurn({
     account: account(),
@@ -644,7 +733,7 @@ test("a streaming update failure is isolated and the existing card still receive
     replyToMessageId: "om_source",
     runId: "om_source",
   });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await scheduler.runNext();
   const result = await output.finish("**最终答案仍然可见**");
   assert.equal(finishes.length, 1);
   assert.match(finishes[0].body.elements.at(-1).content, /最终答案仍然可见/);
@@ -654,6 +743,7 @@ test("a streaming update failure is isolated and the existing card still receive
 test("an ambiguous streaming-card send failure never creates a duplicate fallback message", async () => {
   let cardSends = 0;
   let plainSends = 0;
+  const scheduler = createManualScheduler();
   const adapter = new FeishuAdapter(
     dependencies({
       async startRichCard() {
@@ -669,6 +759,8 @@ test("an ambiguous streaming-card send failure never creates a duplicate fallbac
       },
     }),
     0,
+    undefined,
+    { turnTimers: scheduler },
   );
   const output = adapter.beginTurn({
     account: account(),
@@ -678,7 +770,7 @@ test("an ambiguous streaming-card send failure never creates a duplicate fallbac
     replyToMessageId: "om_source",
     runId: "om_source",
   });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await scheduler.runNext();
   await assert.rejects(output.finish("不要重复发送"), /network timeout/);
   assert.equal(cardSends, 0);
   assert.equal(plainSends, 0);

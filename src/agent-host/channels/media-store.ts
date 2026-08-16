@@ -1,12 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { allowFileRoot, invalidateAllowedRootsCache } from "../file-access";
+import { allowFileRoot } from "../file-access";
 import type { DownloadedInboundAttachment, StagedInboundAttachment } from "./types";
 
 export const CHANNEL_MEDIA_MAX_ATTACHMENTS = 4;
 export const CHANNEL_MEDIA_MAX_BYTES = 20 * 1024 * 1024;
 export const CHANNEL_MEDIA_TTL_MS = 24 * 60 * 60 * 1_000;
+export const CHANNEL_MEDIA_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000;
+
+type ChannelMediaStoreOptions = {
+  cleanupIntervalMs?: number;
+  now?: () => number;
+  timers?: Pick<typeof globalThis, "setInterval" | "clearInterval">;
+};
 
 const MIME_EXTENSIONS: Record<string, string> = {
   "image/jpeg": ".jpg",
@@ -72,13 +79,33 @@ function safeExtension(name: string | undefined, mime: string | undefined): stri
 }
 
 export class ChannelMediaStore {
-  constructor(private readonly root: string) {}
+  private readonly cleanupIntervalMs: number;
+  private readonly now: () => number;
+  private readonly timers: Pick<typeof globalThis, "setInterval" | "clearInterval">;
+  private cleanupTimer: ReturnType<typeof setInterval> | undefined;
+  private cleanupInFlight: Promise<void> | undefined;
+  private lastCleanupAt = 0;
+  private disposed = false;
+
+  constructor(
+    private readonly root: string,
+    options: ChannelMediaStoreOptions = {},
+  ) {
+    this.cleanupIntervalMs = options.cleanupIntervalMs ?? CHANNEL_MEDIA_CLEANUP_INTERVAL_MS;
+    this.now = options.now ?? Date.now;
+    this.timers = options.timers ?? globalThis;
+  }
 
   async initialize(): Promise<void> {
     await this.ensureDirectory(this.root);
     allowFileRoot(this.root);
-    invalidateAllowedRootsCache();
-    await this.cleanupExpired();
+    await this.runCleanup();
+    if (!this.cleanupTimer && !this.disposed) {
+      this.cleanupTimer = this.timers.setInterval(() => {
+        void this.runCleanup().catch(() => undefined);
+      }, this.cleanupIntervalMs);
+      this.cleanupTimer.unref?.();
+    }
   }
 
   private async ensureDirectory(directory: string): Promise<void> {
@@ -97,6 +124,7 @@ export class ChannelMediaStore {
       throw new Error(`单条消息最多支持 ${CHANNEL_MEDIA_MAX_ATTACHMENTS} 个附件`);
     }
     if (attachments.length === 0) return [];
+    this.cleanupOpportunistically();
     const accountDirectory = path.join(this.root, stableSegment(accountId));
     const directory = path.join(accountDirectory, stableSegment(envelopeId));
     await this.ensureDirectory(this.root);
@@ -143,5 +171,29 @@ export class ChannelMediaStore {
         }
       }
     }
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    if (this.cleanupTimer) this.timers.clearInterval(this.cleanupTimer);
+    this.cleanupTimer = undefined;
+    await this.cleanupInFlight?.catch(() => undefined);
+  }
+
+  private cleanupOpportunistically(): void {
+    if (this.disposed || this.now() - this.lastCleanupAt < this.cleanupIntervalMs) return;
+    void this.runCleanup().catch(() => undefined);
+  }
+
+  private runCleanup(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.cleanupInFlight) return this.cleanupInFlight;
+    const now = this.now();
+    this.lastCleanupAt = now;
+    const pending = this.cleanupExpired(now).finally(() => {
+      if (this.cleanupInFlight === pending) this.cleanupInFlight = undefined;
+    });
+    this.cleanupInFlight = pending;
+    return pending;
   }
 }

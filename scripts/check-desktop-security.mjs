@@ -27,6 +27,7 @@ const weixinMedia = read("src/agent-host/channels/adapters/weixin/media.ts");
 const channelContract = read("src/contract/api.ts");
 const desktopContract = read("src/contract/desktop.ts");
 const desktopIpc = read("src/main/ipc.ts");
+const desktopIpcTrust = read("src/main/ipc-trust.ts");
 const updateAdapter = read("src/main/update-adapter.ts");
 const updateManager = read("src/main/update-manager.ts");
 const electronBuilderConfig = read("electron-builder.yml");
@@ -50,6 +51,7 @@ const browserAuthorization = read("src/main/browser/browser-authorization-coordi
 const browserGrantStore = read("src/main/browser/browser-persistent-grant-store.ts");
 const browserTools = read("src/agent-host/browser-tools.ts");
 const browserTabs = read("src/main/browser/browser-tab-manager.ts");
+const browserDevToolsShortcut = read("src/main/browser/browser-devtools-shortcut.ts");
 const browserNetwork = read("src/main/browser/browser-network-interceptor.ts");
 const browserIdentity = read("src/main/browser/browser-identity-manager.ts");
 const browserRecorder = read("src/main/browser/browser-network-recorder.ts");
@@ -256,12 +258,13 @@ const checks = [
       preload.includes('ipcRenderer.invoke("desktop:toolchains:rescan"') &&
       preload.includes('ipcRenderer.invoke("desktop:toolchains:action"') &&
       preload.includes('ipcRenderer.on("toolchains:state"') &&
-      desktopIpc.includes('ipcMain.handle("desktop:toolchains:get-state"') &&
-      desktopIpc.includes('ipcMain.handle("desktop:toolchains:rescan"') &&
-      desktopIpc.includes('ipcMain.handle("desktop:toolchains:action"') &&
+      desktopIpc.includes('trustedHandle("desktop:toolchains:get-state"') &&
+      desktopIpc.includes('trustedHandle("desktop:toolchains:rescan"') &&
+      desktopIpc.includes('trustedHandle("desktop:toolchains:action"') &&
       desktopIpc.includes("isToolchainActionRequest") &&
-      desktopIpc.includes("assertTrustedToolchainSender(event)") &&
-      desktopIpc.includes("event.senderFrame !== win.webContents.mainFrame") &&
+      desktopIpc.includes("assertTrustedSender(event)") &&
+      desktopIpcTrust.includes("event.sender === window.webContents") &&
+      desktopIpcTrust.includes("event.senderFrame === window.webContents.mainFrame") &&
       desktopIpc.includes("toolchainActionConfirmation(request)") &&
       desktopIpc.includes("dialog.showMessageBox") &&
       desktopIpc.includes("validateOptionalToolchainCwd"),
@@ -290,14 +293,14 @@ const checks = [
     "preload updater bridge must use fixed IPC channels",
   ],
   [
-    desktopIpc.includes('ipcMain.handle("desktop:update:set-automatic-checks"') &&
+    desktopIpc.includes('trustedHandle("desktop:update:set-automatic-checks"') &&
       desktopIpc.includes('typeof enabled !== "boolean"') &&
       !/(?:setFeedURL|feedUrl|feedURL)/.test(desktopIpc),
     "updater IPC must validate its only mutable preference and reject feed configuration",
   ],
   [
     updateAdapter.includes("updater.autoDownload = false") &&
-      updateAdapter.includes("updater.autoInstallOnAppQuit = true") &&
+      updateAdapter.includes("updater.autoInstallOnAppQuit = false") &&
       updateAdapter.includes("updater.allowPrerelease = false") &&
       updateAdapter.includes("updater.allowDowngrade = false") &&
       updateAdapter.includes("updater.disableWebInstaller = true") &&
@@ -378,9 +381,11 @@ const checks = [
   ],
   [
     desktopIpc.includes("const requireTrustedBrowser") &&
-      desktopIpc.includes("assertTrustedToolchainSender(event)") &&
-      desktopIpc.includes("event.senderFrame !== win.webContents.mainFrame") &&
-      browserService.includes('this.confirmations.consume(proof, "advanced-browser-mode", patch)') &&
+      desktopIpc.includes("assertTrustedSender(event)") &&
+      desktopIpcTrust.includes("event.sender === window.webContents") &&
+      desktopIpcTrust.includes("event.senderFrame === window.webContents.mainFrame") &&
+      browserService.includes("authorizeBrowserSettingsUpdate(before, patch") &&
+      browserService.includes('this.confirmations.consume(proof, "advanced-browser-mode", payload)') &&
       !browserService.includes('"unsafe-lab"'),
     "Browser settings IPC must validate the main-window sender/frame and consume one-time confirmation proofs",
   ],
@@ -408,7 +413,8 @@ const checks = [
       !main.includes("ignore-certificate-errors") &&
       !browserTabs.includes("ignore-certificate-errors") &&
       !windowFactory.includes("webSecurity: false") &&
-      browserTabs.includes('input.key === "F12"'),
+      browserTabs.includes("isBrowserDevToolsShortcut(input)") &&
+      browserDevToolsShortcut.includes('input.key.toLowerCase() === "f12"'),
     "production Browser code must not expose remote debugging, global certificate bypass, or weaken the main Renderer",
   ],
   [

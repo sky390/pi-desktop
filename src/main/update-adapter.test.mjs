@@ -7,6 +7,7 @@ class FakeElectronUpdater {
   constructor() {
     this.listeners = new Map();
     this.quitCalls = [];
+    this.downloadTokens = [];
     this.autoDownload = true;
     this.autoInstallOnAppQuit = false;
     this.allowPrerelease = true;
@@ -34,7 +35,8 @@ class FakeElectronUpdater {
     return "checked";
   }
 
-  async downloadUpdate() {
+  async downloadUpdate(token) {
+    this.downloadTokens.push(token);
     return ["downloaded"];
   }
 
@@ -51,7 +53,7 @@ test("production adapter applies the stable, consent-first updater policy", asyn
     const adapter = wrapElectronUpdater(updater);
 
     assert.equal(updater.autoDownload, false);
-    assert.equal(updater.autoInstallOnAppQuit, true);
+    assert.equal(updater.autoInstallOnAppQuit, false);
     assert.equal(updater.allowPrerelease, false);
     assert.equal(updater.allowDowngrade, false);
     assert.equal(updater.disableWebInstaller, true);
@@ -83,6 +85,23 @@ test("development update config requires an explicit adapter option", () => {
   const developmentUpdater = new FakeElectronUpdater();
   wrapElectronUpdater(developmentUpdater, { useDevelopmentConfig: true });
   assert.equal(developmentUpdater.forceDevUpdateConfig, true);
+});
+
+test("production downloads use a cancellable token", async () => {
+  const updater = new FakeElectronUpdater();
+  let token;
+  const adapter = wrapElectronUpdater(updater, {
+    createCancellationToken: () => {
+      token = { cancelled: false, cancel: () => (token.cancelled = true) };
+      return token;
+    },
+  });
+
+  const download = adapter.downloadUpdate();
+  adapter.cancelDownload();
+  assert.equal(token.cancelled, true);
+  await download;
+  assert.equal(updater.downloadTokens[0], token);
 });
 
 test("production platform policy enables macOS and unsigned Windows releases", () => {

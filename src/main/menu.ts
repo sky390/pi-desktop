@@ -1,6 +1,12 @@
 import { app, Menu, shell, type BrowserWindow } from "electron";
+import { developerViewRoles } from "./menu-policy";
+import { sendWindowMenuCommand } from "./window-menu-command";
 
-export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckForUpdates?: () => void): void {
+export function installAppMenu(
+  getWindow: () => BrowserWindow | null,
+  onCheckForUpdates?: () => void,
+  isDev = false,
+): void {
   const isMac = process.platform === "darwin";
   const isWindows = process.platform === "win32";
 
@@ -18,10 +24,7 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
                     onCheckForUpdates();
                     return;
                   }
-                  const win = getWindow();
-                  win?.show();
-                  win?.focus();
-                  win?.webContents.send("menu:check-for-updates");
+                  sendWindowMenuCommand(getWindow, "menu:check-for-updates");
                 },
               },
               { type: "separator" as const },
@@ -29,7 +32,7 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
                 label: "Settings…",
                 accelerator: "CmdOrCtrl+,",
                 click: () => {
-                  getWindow()?.webContents.send("menu:settings");
+                  sendWindowMenuCommand(getWindow, "menu:settings");
                 },
               },
               { type: "separator" as const },
@@ -51,14 +54,14 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
           label: "New Session",
           accelerator: "CmdOrCtrl+N",
           click: () => {
-            getWindow()?.webContents.send("menu:new-session");
+            sendWindowMenuCommand(getWindow, "menu:new-session");
           },
         },
         {
           label: "Switch Session…",
           accelerator: "CmdOrCtrl+K",
           click: () => {
-            getWindow()?.webContents.send("menu:switch-session");
+            sendWindowMenuCommand(getWindow, "menu:switch-session");
           },
         },
         { type: "separator" },
@@ -69,7 +72,7 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
                 label: "Settings…",
                 accelerator: "CmdOrCtrl+,",
                 click: () => {
-                  getWindow()?.webContents.send("menu:settings");
+                  sendWindowMenuCommand(getWindow, "menu:settings");
                 },
               },
               { type: "separator" as const },
@@ -92,10 +95,8 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
     {
       label: "View",
       submenu: [
-        { role: "reload" },
-        { role: "forceReload" },
-        { role: "toggleDevTools" },
-        { type: "separator" },
+        ...developerViewRoles(isDev).map((role) => ({ role })),
+        ...(isDev ? [{ type: "separator" as const }] : []),
         { role: "resetZoom" },
         { role: "zoomIn" },
         { role: "zoomOut" },
@@ -123,10 +124,7 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
                     onCheckForUpdates();
                     return;
                   }
-                  const win = getWindow();
-                  win?.show();
-                  win?.focus();
-                  win?.webContents.send("menu:check-for-updates");
+                  sendWindowMenuCommand(getWindow, "menu:check-for-updates");
                 },
               },
               { type: "separator" as const },
@@ -141,7 +139,7 @@ export function installAppMenu(getWindow: () => BrowserWindow | null, onCheckFor
         {
           label: "Export Diagnostics…",
           click: () => {
-            getWindow()?.webContents.send("menu:export-diagnostics");
+            sendWindowMenuCommand(getWindow, "menu:export-diagnostics");
           },
         },
         { type: "separator" },

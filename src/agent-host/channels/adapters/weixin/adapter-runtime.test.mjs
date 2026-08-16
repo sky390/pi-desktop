@@ -1,36 +1,61 @@
+import { importTestBundle } from "#test-bundle";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
-import { build } from "esbuild";
 
-const output = path.join(
-  import.meta.dirname,
-  "../../../../../.artifacts/test-modules",
-  `weixin-adapter-runtime-${process.pid}.mjs`,
-);
-mkdirSync(path.dirname(output), { recursive: true });
-await build({
-  stdin: {
-    contents: [
-      'export { WeixinAdapter } from "./adapter.ts";',
-      'export { ChannelStateStore } from "../../state-store.ts";',
-    ].join("\n"),
-    resolveDir: import.meta.dirname,
-    sourcefile: "weixin-adapter-runtime-test-entry.ts",
-    loader: "ts",
+const { ChannelStateStore, WeixinAdapter, delay } = await importTestBundle(
+  "src/agent-host/channels/adapters/weixin/adapter-runtime",
+  {
+    packages: "external",
+    stdin: {
+      contents: [
+        'export { WeixinAdapter, delay } from "./adapter.ts";',
+        'export { ChannelStateStore } from "../../state-store.ts";',
+      ].join("\n"),
+      resolveDir: import.meta.dirname,
+      sourcefile: "weixin-adapter-runtime-test-entry.ts",
+      loader: "ts",
+    },
   },
-  outfile: output,
-  bundle: true,
-  format: "esm",
-  platform: "node",
-  packages: "external",
-  logLevel: "silent",
-});
+);
 
-const { ChannelStateStore, WeixinAdapter } = await import(`${pathToFileURL(output).href}?v=${Date.now()}`);
+class TrackedAbortSignal {
+  aborted = false;
+  listeners = new Set();
+  removeCount = 0;
+
+  addEventListener(type, listener) {
+    assert.equal(type, "abort");
+    this.listeners.add(listener);
+  }
+
+  removeEventListener(type, listener) {
+    assert.equal(type, "abort");
+    this.removeCount += 1;
+    this.listeners.delete(listener);
+  }
+
+  abort() {
+    this.aborted = true;
+    for (const listener of [...this.listeners]) listener();
+  }
+}
+
+test("delay removes its abort listener after timeout and abort completion", async () => {
+  const timedSignal = new TrackedAbortSignal();
+  await delay(0, timedSignal);
+  assert.equal(timedSignal.listeners.size, 0);
+  assert.equal(timedSignal.removeCount, 1);
+
+  const abortedSignal = new TrackedAbortSignal();
+  const pending = delay(60_000, abortedSignal);
+  abortedSignal.abort();
+  await pending;
+  assert.equal(abortedSignal.listeners.size, 0);
+  assert.equal(abortedSignal.removeCount, 1);
+});
 
 function jsonResponse(value = {}) {
   return {
@@ -106,6 +131,58 @@ test("runtime checkpoints cursor and suppresses duplicate inbound events", async
   assert.equal(state.getCursor("wx-runtime"), "cursor-next");
   assert.equal(state.getContextToken("wx-runtime", "user-one"), "context-one");
   assert.equal(state.isProcessed("wx-runtime", "101"), true);
+});
+
+test("runtime isolates a failed inbound turn and checkpoints the following message", async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const messages = [
+    {
+      message_id: 401,
+      message_type: 1,
+      from_user_id: "user-poison",
+      item_list: [{ type: 1, text_item: { text: "poison" } }],
+    },
+    {
+      message_id: 402,
+      message_type: 1,
+      from_user_id: "user-next",
+      item_list: [{ type: 1, text_item: { text: "still delivered" } }],
+    },
+  ];
+  globalThis.fetch = async (url) =>
+    String(url).includes("getupdates")
+      ? jsonResponse({ ret: 0, msgs: messages, get_updates_buf: "cursor-after-poison" })
+      : jsonResponse();
+
+  const controller = new globalThis.AbortController();
+  const state = stateStore();
+  const inbound = [];
+  const logs = [];
+  await new WeixinAdapter(async () => controller.abort()).start({
+    account: account(),
+    secret: { token: "secret", providerAccountId: "provider", baseUrl: "https://example.test" },
+    signal: controller.signal,
+    state,
+    onInbound: async (envelope) => {
+      inbound.push(envelope.id);
+      if (envelope.id === "401") throw new Error("model rejected?token=sensitive-token");
+      controller.abort();
+    },
+    onStatus: () => undefined,
+    log: (message) => logs.push(message),
+  });
+
+  assert.deepEqual(inbound, ["401", "402"]);
+  assert.equal(state.isProcessed("wx-runtime", "401"), true);
+  assert.equal(state.isProcessed("wx-runtime", "402"), true);
+  assert.equal(state.getCursor("wx-runtime"), "cursor-after-poison");
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /微信入站消息处理失败.*401.*token=\[REDACTED\]/);
+  assert.doesNotMatch(logs[0], /sensitive-token/);
 });
 
 test("runtime downloads Weixin media only through the private adapter capability", async (t) => {

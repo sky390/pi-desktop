@@ -66,6 +66,7 @@ export interface PiRpc {
 type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 type SubEntry = {
@@ -80,9 +81,38 @@ function makeId(): string {
   return `r${nextId}_${Date.now().toString(36)}`;
 }
 
-export function createRpcClient(port: MessagePort): PiRpc {
+export type RpcClientOptions = {
+  callTimeoutMs?: number;
+};
+
+const DEFAULT_CALL_TIMEOUT_MS = 120_000;
+
+type RpcClientPort = {
+  addEventListener(type: "message", listener: (event: MessageEvent) => void): void;
+  addEventListener(type: "close", listener: () => void): void;
+  removeEventListener(type: "message", listener: (event: MessageEvent) => void): void;
+  removeEventListener(type: "close", listener: () => void): void;
+  postMessage(message: unknown): void;
+  start(): void;
+  close(): void;
+};
+
+export function createRpcClient(port: RpcClientPort, options: RpcClientOptions = {}): PiRpc {
   const pending = new Map<string, Pending>();
   const subs = new Map<string, SubEntry>();
+  const configuredTimeout = options.callTimeoutMs;
+  const callTimeoutMs =
+    typeof configuredTimeout === "number" && Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? configuredTimeout
+      : DEFAULT_CALL_TIMEOUT_MS;
+
+  const rejectPending = (shape: RpcErrorShape) => {
+    for (const [, entry] of pending) {
+      clearTimeout(entry.timer);
+      entry.reject(new RpcError(shape));
+    }
+    pending.clear();
+  };
 
   const onMessage = (ev: MessageEvent) => {
     const msg = ev.data as WireMessage;
@@ -92,6 +122,7 @@ export function createRpcClient(port: MessagePort): PiRpc {
       const p = pending.get(msg.id);
       if (!p) return;
       pending.delete(msg.id);
+      clearTimeout(p.timer);
       if (msg.ok) p.resolve(msg.result);
       else {
         p.reject(new RpcError(msg.error ?? { code: "UNKNOWN", message: "Unknown RPC error" }));
@@ -112,7 +143,13 @@ export function createRpcClient(port: MessagePort): PiRpc {
     }
   };
 
+  const onClose = () => {
+    rejectPending({ code: "CLOSED", message: "RPC port closed" });
+    subs.clear();
+  };
+
   port.addEventListener("message", onMessage);
+  port.addEventListener("close", onClose);
   port.start();
 
   return {
@@ -120,9 +157,14 @@ export function createRpcClient(port: MessagePort): PiRpc {
       const params = (args[0] ?? undefined) as unknown;
       const id = makeId();
       return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          if (!pending.delete(id)) return;
+          reject(new RpcError({ code: "TIMEOUT", message: `RPC call timed out: ${String(method)}` }));
+        }, callTimeoutMs);
         pending.set(id, {
           resolve: resolve as (v: unknown) => void,
           reject,
+          timer,
         });
         const req: WireRequest = {
           kind: "request",
@@ -134,6 +176,7 @@ export function createRpcClient(port: MessagePort): PiRpc {
           port.postMessage(req);
         } catch (err) {
           pending.delete(id);
+          clearTimeout(timer);
           reject(err instanceof Error ? err : new Error(String(err)));
         }
       });
@@ -141,22 +184,18 @@ export function createRpcClient(port: MessagePort): PiRpc {
 
     subscribe(topic, key, on) {
       const id = makeId();
-      subs.set(id, {
-        topic: topic as string,
-        key,
-        handler: on as (ev: unknown) => void,
-      });
       const msg: WireSubscribe = {
         kind: "subscribe",
         id,
         topic: topic as string,
         key,
       };
-      try {
-        port.postMessage(msg);
-      } catch {
-        /* port may already be closed */
-      }
+      port.postMessage(msg);
+      subs.set(id, {
+        topic: topic as string,
+        key,
+        handler: on as (ev: unknown) => void,
+      });
       return () => {
         subs.delete(id);
         const unsub: WireUnsubscribe = {
@@ -175,10 +214,8 @@ export function createRpcClient(port: MessagePort): PiRpc {
 
     close() {
       port.removeEventListener("message", onMessage);
-      for (const [, p] of pending) {
-        p.reject(new RpcError({ code: "CLOSED", message: "RPC port closed" }));
-      }
-      pending.clear();
+      port.removeEventListener("close", onClose);
+      rejectPending({ code: "CLOSED", message: "RPC port closed" });
       subs.clear();
       try {
         port.close();
@@ -193,8 +230,13 @@ export function createRpcClient(port: MessagePort): PiRpc {
 // Server (agent-host)
 // ---------------------------------------------------------------------------
 
+export type RpcRequestContext = {
+  setLease(key: string, release: () => void): void;
+  releaseLease(key: string): boolean;
+};
+
 export type ApiHandler = {
-  [M in ApiMethod]?: (params: ApiParams<M>) => Promise<ApiResult<M>> | ApiResult<M>;
+  [M in ApiMethod]?: (params: ApiParams<M>, context: RpcRequestContext) => Promise<ApiResult<M>> | ApiResult<M>;
 };
 
 export type StreamSink = {
@@ -260,20 +302,58 @@ function listenPort(port: AnyMessagePort, onData: (data: unknown) => void): () =
 }
 
 export function createRpcServer(): RpcServer {
-  const handlers: ApiHandler = {};
+  const handlers = new Map<string, (params: unknown, context: RpcRequestContext) => Promise<unknown> | unknown>();
   const ports = new Set<AnyMessagePort>();
   /** port → subscription id → { topic, key } */
   const portSubs = new Map<AnyMessagePort, Map<string, { topic: string; key: string }>>();
   const portUnlisten = new Map<AnyMessagePort, () => void>();
   const portCloseUnlisten = new Map<AnyMessagePort, () => void>();
+  const portLeases = new Map<AnyMessagePort, Map<string, () => void>>();
 
   function forgetPort(port: AnyMessagePort): void {
     ports.delete(port);
     portSubs.delete(port);
+    const leases = portLeases.get(port);
+    portLeases.delete(port);
+    for (const release of leases?.values() ?? []) {
+      try {
+        release();
+      } catch {
+        /* isolate resource finalizers */
+      }
+    }
     portUnlisten.get(port)?.();
     portUnlisten.delete(port);
     portCloseUnlisten.get(port)?.();
     portCloseUnlisten.delete(port);
+  }
+
+  function requestContext(port: AnyMessagePort): RpcRequestContext {
+    return {
+      setLease(key, release) {
+        if (!ports.has(port)) {
+          release();
+          return;
+        }
+        const leases = portLeases.get(port) ?? new Map<string, () => void>();
+        const previous = leases.get(key);
+        leases.set(key, release);
+        portLeases.set(port, leases);
+        if (previous && previous !== release) previous();
+      },
+      releaseLease(key) {
+        const leases = portLeases.get(port);
+        const release = leases?.get(key);
+        if (!release) return false;
+        leases?.delete(key);
+        try {
+          release();
+        } catch {
+          /* isolate explicit resource release */
+        }
+        return true;
+      },
+    };
   }
 
   function ensureSubs(port: AnyMessagePort): Map<string, { topic: string; key: string }> {
@@ -299,7 +379,7 @@ export function createRpcServer(): RpcServer {
     }
     if (msg.kind !== "request") return;
 
-    const handler = handlers[msg.method as ApiMethod] as ((params: unknown) => Promise<unknown> | unknown) | undefined;
+    const handler = handlers.get(msg.method);
 
     let response: WireResponse;
     try {
@@ -309,7 +389,7 @@ export function createRpcServer(): RpcServer {
           message: `Unknown method: ${msg.method}`,
         });
       }
-      const result = await handler(msg.params);
+      const result = await handler(msg.params, requestContext(port));
       response = { kind: "response", id: msg.id, ok: true, result };
     } catch (err) {
       const error: RpcErrorShape =
@@ -330,13 +410,31 @@ export function createRpcServer(): RpcServer {
     try {
       port.postMessage(response);
     } catch {
-      /* port closed */
+      const fallback: WireResponse = {
+        kind: "response",
+        id: msg.id,
+        ok: false,
+        error: { code: "SERIALIZATION_FAILED", message: "RPC response could not be serialized" },
+      };
+      try {
+        port.postMessage(fallback);
+      } catch {
+        forgetPort(port);
+        try {
+          port.close?.();
+        } catch {
+          /* ignore a transport that is already closed */
+        }
+      }
     }
   }
 
   return {
     handle(next) {
-      Object.assign(handlers, next);
+      for (const [method, handler] of Object.entries(next)) {
+        if (typeof handler === "function")
+          handlers.set(method, handler as (params: unknown, context: RpcRequestContext) => Promise<unknown> | unknown);
+      }
     },
 
     emit(topic, key, data) {
@@ -360,7 +458,12 @@ export function createRpcServer(): RpcServer {
         try {
           port.postMessage(wire);
         } catch {
-          /* ignore */
+          forgetPort(port);
+          try {
+            port.close?.();
+          } catch {
+            /* ignore a transport that is already closed */
+          }
         }
       }
     },
@@ -369,6 +472,7 @@ export function createRpcServer(): RpcServer {
       if (ports.has(port)) return;
       ports.add(port);
       ensureSubs(port);
+      portLeases.set(port, new Map());
       const unlisten = listenPort(port, (data) => {
         void onPortMessage(port, data);
       });

@@ -10,6 +10,7 @@ import type {
   FileMeta,
   HistoryWindow,
   LoginProgressEvent,
+  ModelPreferencesResult,
   ModelsConfig,
   ModelsListResult,
   PagedContextInfo,
@@ -235,6 +236,7 @@ export interface Api {
     result: {
       files: string[];
       truncated: boolean;
+      truncatedReason?: "depth" | "count";
       matches?: Array<{ path: string; isDir?: boolean; score?: number }>;
     };
   };
@@ -287,6 +289,14 @@ export interface Api {
         error?: string;
       }>;
     };
+  };
+  "models.preferences.get": {
+    params: { cwd?: string } | void;
+    result: ModelPreferencesResult;
+  };
+  "models.preferences.set": {
+    params: { cwd?: string; enabledModels: string[] | null };
+    result: ModelPreferencesResult;
   };
   /** Built-in providers with their current overlay (custom Base URL / enabled models). */
   "modelsConfig.providers": { params: void; result: { providers: BuiltinProviderInfo[] } };
@@ -398,8 +408,6 @@ export interface Streams {
     size?: number;
     message?: string;
   };
-  "host.restarted": { reason: string };
-  "host.ready": { ts: number };
   "channels.status": ChannelStatus;
   "channels.login": ChannelLoginEvent;
   "channels.pairing": ChannelPairingRequest;

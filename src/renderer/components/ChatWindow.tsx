@@ -8,7 +8,6 @@ import type {
   ExtensionUiRequest,
   SessionInfo,
   SessionTreeNode,
-  ToolResultMessage,
 } from "@/lib/types";
 import { normalizeCustomPanelLines, parseAnsiLine } from "@/lib/ansi";
 import {
@@ -25,7 +24,10 @@ import { useAgentSession, type AgentPhase, type NoticeItem } from "@/hooks/useAg
 import { useAudio } from "@/hooks/useAudio";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
+import { useObservedElementHeight } from "@/hooks/useObservedElementHeight";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import { MessageRenderKeyRegistry, type MessageRenderRole } from "@/lib/message-render-key";
+import { buildToolMessageIndex } from "@/lib/tool-message-index";
 import { useI18n } from "@/i18n";
 import appIconUrl from "../../../build/icon.png";
 
@@ -140,6 +142,36 @@ function withAssistantBlocks(
   return next;
 }
 
+type AssistantRenderParts = {
+  processBlocks: AssistantContentBlock[];
+  processMessage: AssistantMessage | null;
+  answerMessage: AssistantMessage | null;
+};
+
+function getAssistantRenderParts(
+  cache: WeakMap<AssistantMessage, AssistantRenderParts>,
+  message: AssistantMessage,
+): AssistantRenderParts {
+  const existing = cache.get(message);
+  if (existing) return existing;
+  const split = splitFinalAssistantBlocks(message);
+  const created: AssistantRenderParts = {
+    processBlocks: split.processBlocks,
+    processMessage:
+      split.processBlocks.length > 0
+        ? withAssistantBlocks(message, split.processBlocks, { omitUsage: true, omitFailure: true })
+        : null,
+    answerMessage:
+      split.answerBlocks.length > 0
+        ? withAssistantBlocks(message, split.answerBlocks)
+        : isAssistantFailure(message)
+          ? withAssistantBlocks(message, [])
+          : null,
+  };
+  cache.set(message, created);
+  return created;
+}
+
 function ProcessDetailsGroup({
   messageCount,
   toolCallCount,
@@ -231,6 +263,8 @@ export function ChatWindow({
   const { soundEnabled, onSoundToggle, playDoneSound, unlockAudio } = useAudio();
   const isMobile = useIsMobile();
   const { t } = useI18n();
+  const messageRenderKeys = useRef(new MessageRenderKeyRegistry()).current;
+  const assistantRenderParts = useRef(new WeakMap<AssistantMessage, AssistantRenderParts>()).current;
 
   // Wrap onAgentEnd to play the completion sound. This is more reliable than
   // wrapping handleAgentEventRef because useAgentSession overwrites that ref
@@ -390,6 +424,11 @@ export function ChatWindow({
     () => (streamState.streamingMessage ? toMinimapMessage(streamState.streamingMessage) : null),
     [streamState.streamingMessage],
   );
+  const toolMessageIndex = useMemo(() => buildToolMessageIndex(messages), [messages]);
+  const insertEditedContent = useCallback(
+    (content: string) => chatInputRef?.current?.insertIfEmpty(content),
+    [chatInputRef],
+  );
   const olderHistorySentinelRef = useRef<HTMLDivElement | null>(null);
   const automaticHistoryPagesRef = useRef(0);
 
@@ -415,6 +454,7 @@ export function ChatWindow({
 
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !agentRunning;
   const messageCwd = session?.cwd ?? newSessionCwd ?? undefined;
+  const chatViewportHeight = useObservedElementHeight(scrollContainerRef);
 
   const availableThinkingLevels = displayModelValue
     ? (modelThinkingLevels[`${displayModelValue.provider}:${displayModelValue.modelId}`] ?? null)
@@ -666,13 +706,6 @@ export function ChatWindow({
                   <ExtensionStatusBar statuses={extensionStatuses} />
 
                   {(() => {
-                    const toolResultsMap = new Map<string, ToolResultMessage>();
-                    for (const msg of messages) {
-                      if (msg.role === "toolResult") {
-                        toolResultsMap.set((msg as ToolResultMessage).toolCallId, msg as ToolResultMessage);
-                      }
-                    }
-
                     let lastUserIdx = -1;
                     for (let i = messages.length - 1; i >= 0; i--) {
                       if (messages[i].role === "user") {
@@ -711,7 +744,7 @@ export function ChatWindow({
                       idx: number,
                       options: {
                         attachRef?: boolean;
-                        keyPrefix?: string;
+                        renderRole?: MessageRenderRole;
                         messageOverride?: AgentMessage;
                         showTimestamp?: boolean;
                       } = {},
@@ -723,7 +756,9 @@ export function ChatWindow({
                           : undefined;
                       const isVisible = msg.role === "user" || msg.role === "assistant";
                       const currentRefIdx = visibleRefIndexByMessage.get(idx);
-                      const keyPrefix = options.keyPrefix ?? "message";
+                      const renderRole = options.renderRole ?? "message";
+                      const renderKey = messageRenderKeys.keyFor(messages[idx], entryIds[idx], renderRole);
+                      const toolData = toolMessageIndex.get(messages[idx]);
                       let showTimestamp = false;
                       if (msg.role === "assistant") {
                         showTimestamp = timestampAssistantIndices.has(idx);
@@ -734,10 +769,11 @@ export function ChatWindow({
                       }
                       if (options.showTimestamp !== undefined) showTimestamp = options.showTimestamp;
                       const view = (
-                        <SessionProfiler key={`${keyPrefix}-view-${idx}`} id="MessageView">
+                        <SessionProfiler key={renderKey} id="MessageView">
                           <MessageView
                             message={msg}
-                            toolResults={toolResultsMap}
+                            toolResults={toolData?.results}
+                            toolCallDurations={toolData?.durations}
                             modelNames={modelNames}
                             cwd={messageCwd}
                             onOpenFile={onOpenFile}
@@ -748,7 +784,7 @@ export function ChatWindow({
                             forking={forkingEntryId === entryIds[idx]}
                             onNavigate={agentRunning ? undefined : handleNavigate}
                             prevAssistantEntryId={agentRunning ? undefined : prevAssistantEntryId}
-                            onEditContent={(content) => chatInputRef?.current?.insertIfEmpty(content)}
+                            onEditContent={insertEditedContent}
                             onLoadDeferredContent={loadDeferredContent}
                             showTimestamp={showTimestamp}
                             prevTimestamp={
@@ -761,7 +797,7 @@ export function ChatWindow({
                       );
                       if (!isVisible || options.attachRef === false || currentRefIdx === undefined) return view;
                       return (
-                        <div key={`${keyPrefix}-${idx}`} ref={attachVisibleRef(idx, currentRefIdx)}>
+                        <div key={renderKey} ref={attachVisibleRef(idx, currentRefIdx)}>
                           {view}
                         </div>
                       );
@@ -812,20 +848,9 @@ export function ChatWindow({
                         hasDisplayableProcessMessage(messages[processIdx]),
                       );
                       const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
-                      const finalSplit = splitFinalAssistantBlocks(finalAssistant);
-                      const finalProcessMessage =
-                        finalSplit.processBlocks.length > 0
-                          ? withAssistantBlocks(finalAssistant, finalSplit.processBlocks, {
-                              omitUsage: true,
-                              omitFailure: true,
-                            })
-                          : null;
-                      const finalAnswerMessage =
-                        finalSplit.answerBlocks.length > 0
-                          ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
-                          : isAssistantFailure(finalAssistant)
-                            ? withAssistantBlocks(finalAssistant, [])
-                            : null;
+                      const finalParts = getAssistantRenderParts(assistantRenderParts, finalAssistant);
+                      const finalProcessMessage = finalParts.processMessage;
+                      const finalAnswerMessage = finalParts.answerMessage;
 
                       const processCount = visibleProcessIndices.length + (finalProcessMessage ? 1 : 0);
                       if (processCount > 0) {
@@ -839,16 +864,16 @@ export function ChatWindow({
                             messageCount={processCount}
                             toolCallCount={
                               countToolCalls(messages, visibleProcessIndices) +
-                              countToolCallBlocks(finalSplit.processBlocks)
+                              countToolCallBlocks(finalParts.processBlocks)
                             }
                           >
                             {visibleProcessIndices.map((processIdx) =>
-                              renderMessage(processIdx, { attachRef: false, keyPrefix: "process" }),
+                              renderMessage(processIdx, { attachRef: false, renderRole: "process" }),
                             )}
                             {finalProcessMessage &&
                               renderMessage(finalAssistantIdx, {
                                 attachRef: false,
-                                keyPrefix: "process-final",
+                                renderRole: "process-final",
                                 messageOverride: finalProcessMessage,
                                 showTimestamp: false,
                               })}
@@ -856,7 +881,15 @@ export function ChatWindow({
                         );
                         rendered.push(
                           <div
-                            key={`process-group-${userIdx}-${finalAssistantIdx}`}
+                            key={`process-group:${messageRenderKeys.keyFor(
+                              messages[userIdx],
+                              entryIds[userIdx],
+                              "message",
+                            )}:${messageRenderKeys.keyFor(
+                              messages[finalAssistantIdx],
+                              entryIds[finalAssistantIdx],
+                              "final",
+                            )}`}
                             ref={
                               processRefIdx === undefined
                                 ? undefined
@@ -871,7 +904,12 @@ export function ChatWindow({
                       }
 
                       if (finalAnswerMessage) {
-                        rendered.push(renderMessage(finalAssistantIdx, { messageOverride: finalAnswerMessage }));
+                        rendered.push(
+                          renderMessage(finalAssistantIdx, {
+                            renderRole: "final",
+                            messageOverride: finalAnswerMessage,
+                          }),
+                        );
                       }
                       for (let renderIdx = finalAssistantIdx + 1; renderIdx < endIdx; renderIdx++) {
                         rendered.push(renderMessage(renderIdx));
@@ -901,11 +939,7 @@ export function ChatWindow({
 
                   <div ref={liveContentEndRef} />
 
-                  {agentRunning && (
-                    <div
-                      style={{ height: scrollContainerRef.current ? scrollContainerRef.current.clientHeight : "80vh" }}
-                    />
-                  )}
+                  {agentRunning && <div style={{ height: chatViewportHeight }} />}
 
                   <div ref={messagesEndRef} />
                 </div>

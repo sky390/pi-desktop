@@ -720,6 +720,14 @@ function ThinkingLevelMapEditor({
   onChange: (v: Record<string, string | null> | undefined) => void;
 }) {
   const { t } = useI18n();
+  const THINKING_LEVEL_LABELS: Record<ThinkingLevel, string> = {
+    off: t("thinkingOff", "Off"),
+    minimal: t("thinkingMinimal", "Minimal"),
+    low: t("thinkingLow", "Low"),
+    medium: t("thinkingMedium", "Medium"),
+    high: t("thinkingHigh", "High"),
+    xhigh: t("thinkingXHigh", "Extra high"),
+  };
   const map = value ?? {};
 
   const setLevel = (level: ThinkingLevel, entry: string | null | "omit") => {
@@ -796,17 +804,7 @@ function ThinkingLevelMapEditor({
                   textDecoration: state === "null" ? "line-through" : "none",
                 }}
               >
-                {t(
-                  {
-                    off: "thinkingOff",
-                    minimal: "thinkingMinimal",
-                    low: "thinkingLow",
-                    medium: "thinkingMedium",
-                    high: "thinkingHigh",
-                    xhigh: "thinkingXHigh",
-                  }[level],
-                  level,
-                )}
+                {THINKING_LEVEL_LABELS[level]}
               </span>
             </div>
 
@@ -940,6 +938,12 @@ function ModelDetail({
   onDelete: () => void;
 }) {
   const { t } = useI18n();
+  const USAGE_FIELD_LABELS: Record<keyof NonNullable<ModelEntry["cost"]>, string> = {
+    input: t("usageInput", "Input"),
+    output: t("usageOutput", "Output"),
+    cacheRead: t("cacheRead", "Cache read"),
+    cacheWrite: t("cacheWrite", "Cache write"),
+  };
   const [testState, setTestState] = useState<ModelTestState>({ phase: "idle" });
   const set = <K extends keyof ModelEntry>(k: K, v: ModelEntry[K]) => onChange({ ...model, [k]: v });
   const costVal = (k: keyof NonNullable<ModelEntry["cost"]>) =>
@@ -1013,11 +1017,20 @@ function ModelDetail({
                 maxWidth: 260,
                 height: 24,
                 padding: "0 8px",
-                border: `1px solid ${testState.phase === "error" ? "#fecaca" : testState.phase === "success" ? "#bbf7d0" : "var(--border)"}`,
+                border: `1px solid ${testState.phase === "error" ? "var(--danger-border)" : testState.phase === "success" ? "var(--success-border)" : "var(--border)"}`,
                 borderRadius: 4,
                 background:
-                  testState.phase === "error" ? "#fee2e2" : testState.phase === "success" ? "#dcfce7" : "#e5e7eb",
-                color: "#111827",
+                  testState.phase === "error"
+                    ? "var(--danger-soft)"
+                    : testState.phase === "success"
+                      ? "var(--success-soft)"
+                      : "var(--bg-hover)",
+                color:
+                  testState.phase === "error"
+                    ? "var(--danger)"
+                    : testState.phase === "success"
+                      ? "var(--success)"
+                      : "var(--text-muted)",
                 fontSize: 11,
                 display: "inline-flex",
                 alignItems: "center",
@@ -1038,12 +1051,12 @@ function ModelDetail({
             style={{
               height: 32,
               padding: "0 10px",
-              background: testState.phase === "success" ? "#16a34a" : "none",
-              border: `1px solid ${testState.phase === "success" ? "#16a34a" : "var(--border)"}`,
+              background: testState.phase === "success" ? "var(--success)" : "none",
+              border: `1px solid ${testState.phase === "success" ? "var(--success)" : "var(--border)"}`,
               borderRadius: 4,
               color:
                 testState.phase === "success"
-                  ? "#fff"
+                  ? "var(--on-accent)"
                   : !model.id.trim() || testState.phase === "testing"
                     ? "var(--text-dim)"
                     : "var(--text-muted)",
@@ -1194,19 +1207,7 @@ function ModelDetail({
         <SectionTitle>{t("costPerMillionTokens", "Cost (per million tokens)")}</SectionTitle>
         <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
           {(["input", "output", "cacheRead", "cacheWrite"] as const).map((k) => (
-            <Field
-              key={k}
-              label={t(
-                k === "input"
-                  ? "usageInput"
-                  : k === "output"
-                    ? "usageOutput"
-                    : k === "cacheRead"
-                      ? "cacheRead"
-                      : "cacheWrite",
-                k,
-              )}
-            >
+            <Field key={k} label={USAGE_FIELD_LABELS[k]}>
               <NumInput value={costVal(k)} onChange={(v) => setCost(k, v)} placeholder="0" />
             </Field>
           ))}
@@ -1230,22 +1231,20 @@ function OAuthDetail({ provider, onRefresh }: { provider: OAuthProvider; onRefre
     }
   }, [loginState.phase]);
 
-  // Reset state when provider changes and invalidate any in-flight startup.
+  // Reset state on entry/provider changes. The outgoing effect owns cancellation
+  // for its captured provider, so a replacement provider is never cancelled.
   useEffect(() => {
+    const providerId = provider.id;
     loginAttemptRef.current += 1;
     setLoginState({ phase: "idle" });
     setInputValue("");
     eventSourceRef.current?.close();
     eventSourceRef.current = null;
-    void call("auth.loginCancel", { provider: provider.id }).catch(() => {});
-  }, [provider.id]);
-
-  useEffect(() => {
     return () => {
       loginAttemptRef.current += 1;
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
-      void call("auth.loginCancel", { provider: provider.id }).catch(() => {});
+      void call("auth.loginCancel", { provider: providerId }).catch(() => {});
     };
   }, [provider.id]);
 
@@ -2616,6 +2615,7 @@ export function ModelsConfig({
   const isMobile = useIsMobile();
   const { t } = useI18n();
   const [config, setConfig] = useState<ModelsJson>({ providers: {} });
+  const [configVersion, setConfigVersion] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -2788,11 +2788,21 @@ export function ModelsConfig({
       const res = await fetch("/api/models-config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify({ config, expectedVersion: configVersion }),
       });
-      const d = (await res.json()) as { success?: boolean; error?: string };
-      if (!res.ok || d.error) setSaveError(d.error ?? `HTTP ${res.status}`);
+      const d = (await res.json()) as { success?: boolean; error?: string; version?: string };
+      if (!res.ok || d.error) {
+        if (res.status === 409)
+          setSaveError(
+            t(
+              "modelConfigConflict",
+              "models.json changed outside this editor. Your edits are preserved here; copy or compare them before reloading the disk version to merge manually.",
+            ),
+          );
+        else setSaveError(d.error ?? `HTTP ${res.status}`);
+      } else if (typeof d.version !== "string") setSaveError("Invalid models config save response");
       else {
+        setConfigVersion(d.version);
         setSavedOk(true);
         onChanged?.();
         setTimeout(() => setSavedOk(false), 2000);
@@ -2802,7 +2812,7 @@ export function ModelsConfig({
     } finally {
       setSaving(false);
     }
-  }, [config, onChanged]);
+  }, [config, configVersion, onChanged, t]);
 
   const providers = Object.entries(config.providers ?? {});
   // Built-in provider overlays are managed by the "Providers" section above and
