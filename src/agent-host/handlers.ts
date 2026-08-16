@@ -56,6 +56,7 @@ import {
   type SessionRuntimeState,
 } from "../contract/types";
 import type { SessionTreeNode } from "../shared/types";
+import { extractBashFileOps } from "../renderer/lib/bash-file-ops";
 import { allowFileRoot, getAllowedFileRoots, isFilePathAllowed } from "./file-access";
 import {
   activateSession,
@@ -2770,7 +2771,27 @@ function ensureSessionEvents(
   // Replace any stale binding for this session id (re-opened after idle destroy)
   clearSessionEventBinding(key);
 
+  // Sync existence probe for write targets, keyed by tool call id. The probe
+  // runs here in the host process on tool_execution_start — the agent emits
+  // that event synchronously before executing the tool, so a statSync here
+  // always sees the pre-execution state (an async renderer-side probe races
+  // the bash write and misclassifies brand-new files as modify).
+  const existsProbes = new Map<string, Record<string, boolean>>();
+  const sessionCwd =
+    typeof (session as { cwd?: unknown }).cwd === "string" ? ((session as { cwd?: string }).cwd ?? "") : "";
+
   const unsub = session.onEvent((event) => {
+    if (event.type === "tool_execution_start") {
+      const probe = probeToolTargetsSync(event, sessionCwd);
+      if (probe) existsProbes.set(String(event.toolCallId), probe);
+    } else if (event.type === "tool_execution_end") {
+      const id = String(event.toolCallId);
+      const probe = existsProbes.get(id);
+      if (probe) {
+        existsProbes.delete(id);
+        event = { ...event, fileExistsProbe: probe };
+      }
+    }
     server.emit("agent.events", key, event as never);
     // ISSUE-015: only agent_end (not synthetic prompt_done) for system notifications
     if (event.type === "agent_end") {
@@ -2789,4 +2810,34 @@ function ensureSessionEvents(
   session.onDestroy?.(() => {
     clearSessionEventBinding(key);
   });
+}
+
+/**
+ * Synchronously resolve the write targets of a tool call and check whether
+ * each exists on disk, mirroring the renderer's create-vs-modify probe but
+ * without the async race (this runs before the tool executes). Returns null
+ * when the call has no resolvable write targets. edit/write use their path
+ * argument directly; bash targets are parsed from the command string.
+ */
+function probeToolTargetsSync(
+  event: { type: string; [k: string]: unknown },
+  cwd: string,
+): Record<string, boolean> | null {
+  const name = event.toolName;
+  const args = event.args;
+  if (!args || typeof args !== "object") return null;
+  const a = args as Record<string, unknown>;
+  if (name === "edit" || name === "write") {
+    const target = typeof a.path === "string" ? a.path : typeof a.file_path === "string" ? a.file_path : "";
+    return target ? { [target]: existsSync(target) } : null;
+  }
+  if (name === "bash") {
+    const command = typeof a.command === "string" ? a.command : "";
+    const targets = extractBashFileOps(command, cwd).filter((op) => op.op === "write" || op.op === "touch");
+    if (targets.length === 0) return null;
+    const result: Record<string, boolean> = {};
+    for (const op of targets) result[op.path] = existsSync(op.path);
+    return result;
+  }
+  return null;
 }

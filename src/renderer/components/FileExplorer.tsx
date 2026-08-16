@@ -146,6 +146,16 @@ function TreeNode({
         <button
           type="button"
           onClick={handleClick}
+          onContextMenu={(event) => {
+            if (node.isDir) return;
+            event.preventDefault();
+            if (downloading) return;
+            setDownloading(true);
+            void import("@/lib/file-blob")
+              .then(({ downloadFileViaRpc }) => downloadFileViaRpc(node.fullPath, node.name))
+              .catch((error) => console.error("download failed", error))
+              .finally(() => setDownloading(false));
+          }}
           aria-expanded={node.isDir ? open : undefined}
           aria-label={
             node.isDir
@@ -154,14 +164,14 @@ function TreeNode({
                 : t("expandFolder", "Expand folder {name}").replace("{name}", node.name)
               : t("openFile", "Open file {name}").replace("{name}", node.name)
           }
-          title={node.fullPath}
+          title={`${node.fullPath} · ${t("downloadFileContextHint", "Right-click to download")}`}
           style={{
             display: "flex",
             alignItems: "center",
             gap: 4,
             width: "100%",
             paddingLeft: 8 + depth * 14,
-            paddingRight: (hovered || focusedWithin) && onAtMention ? (node.isDir ? 88 : 122) : 8,
+            paddingRight: (hovered || focusedWithin) && onAtMention ? 88 : 8,
             height: 40,
             cursor: "pointer",
             background: hovered || focusedWithin ? "var(--bg-hover)" : "transparent",
@@ -227,7 +237,7 @@ function TreeNode({
             title={t("insertPathIntoChat", "Insert path into chat")}
             style={{
               position: "absolute",
-              right: !node.isDir ? 40 : 4,
+              right: 4,
               top: "50%",
               transform: "translateY(-50%)",
               display: "flex",
@@ -260,57 +270,6 @@ function TreeNode({
               <path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8" />
             </svg>
             {t("mention", "mention")}
-          </button>
-        )}
-        {(hovered || focusedWithin) && !node.isDir && (
-          <button
-            type="button"
-            disabled={downloading}
-            onClick={(e) => {
-              e.stopPropagation();
-              setDownloading(true);
-              void import("@/lib/file-blob")
-                .then(({ downloadFileViaRpc }) => downloadFileViaRpc(node.fullPath, node.name))
-                .catch((error) => console.error("download failed", error))
-                .finally(() => setDownloading(false));
-            }}
-            title={t("downloadFile", "Download file")}
-            style={{
-              position: "absolute",
-              right: 4,
-              top: "50%",
-              transform: "translateY(-50%)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              gap: 4,
-              padding: "0 5px",
-              width: 30,
-              height: 30,
-              background: "var(--bg-panel)",
-              border: "1px solid var(--border)",
-              borderRadius: 4,
-              color: "var(--text-muted)",
-              cursor: downloading ? "wait" : "pointer",
-              fontSize: 12,
-              fontWeight: 600,
-              whiteSpace: "nowrap",
-            }}
-          >
-            <svg
-              width="11"
-              height="11"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.2"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-              <polyline points="7 10 12 15 17 10" />
-              <line x1="12" y1="15" x2="12" y2="3" />
-            </svg>
           </button>
         )}
       </div>

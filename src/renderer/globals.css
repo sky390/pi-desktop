@@ -421,10 +421,9 @@ code {
   list-style: none;
 }
 .markdown-body .task-list-item {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr);
+  display: flex;
+  align-items: flex-start;
   gap: 7px;
-  align-items: start;
   padding-left: 0;
 }
 .markdown-body .task-list-item::marker {
@@ -435,6 +434,7 @@ code {
   width: 14px;
   height: 14px;
   margin: 5px 0 0;
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg);

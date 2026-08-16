@@ -41,24 +41,41 @@ export function extractBashFileOps(command: string, cwd: string): BashFileOp[] {
     }
 
     // echo/cat/printf/tee "..." >|>> file — a write with a redirect target.
-    const writeMatch = segment.match(/(?:^|[;&|]\s*)(?:echo|cat|printf|tee)\b[^>]*?(\d?>>?)\s*(.+)$/i);
+    // The redirect operator must sit OUTSIDE quotes: echo output text may
+    // itself contain `>` (e.g. `echo "a -> b"`), which bash treats as literal
+    // text but a naive `[^>]*?` scan would mistake for a redirect and record a
+    // bogus write to `b"`.
+    const writeMatch = segment.match(/(?:^|[;&|]\s*)(?:echo|cat|printf|tee)\b(.*)$/i);
     if (writeMatch && !segment.includes("2>&1") && !segment.includes("2>")) {
-      const redirect = writeMatch[1];
-      const append = redirect.includes(">>");
-      const target = firstToken(writeMatch[2]);
-      const resolved = resolvePath(target, curDir, home);
-      if (resolved) ops.push({ op: "write", path: resolved, append });
+      const redirIdx = findRedirectOp(writeMatch[1], 0);
+      if (redirIdx !== -1) {
+        const after = writeMatch[1].slice(redirIdx);
+        const redir = after.match(/^(\d?>>?)/);
+        if (redir) {
+          const append = redir[1].includes(">>");
+          const target = firstToken(after.slice(redir[1].length));
+          const resolved = resolvePath(target, curDir, home);
+          if (resolved) ops.push({ op: "write", path: resolved, append });
+        }
+      }
       continue;
     }
 
-    // Generic > / >> redirect (e.g. `some-cmd > file`).
-    const genericWrite = segment.match(/(?:^|[;&|]\s*)(?:[^>]*?)(\d?>>?)\s*([^\s;|&]+)/);
-    if (genericWrite && !segment.includes("2>&1") && !segment.includes("2>")) {
-      const append = genericWrite[1].includes(">>");
-      const target = stripQuotes(genericWrite[2]);
-      const resolved = resolvePath(target, curDir, home);
-      if (resolved) ops.push({ op: "write", path: resolved, append });
-      continue;
+    // Generic > / >> redirect (e.g. `some-cmd > file`), same quote-awareness.
+    // Only fall through to the mkdir/rm/touch checks when no redirect exists.
+    if (!segment.includes("2>&1") && !segment.includes("2>")) {
+      const redirIdx = findRedirectOp(segment, 0);
+      if (redirIdx !== -1) {
+        const after = segment.slice(redirIdx);
+        const redir = after.match(/^(\d?>>?)/);
+        if (redir) {
+          const append = redir[1].includes(">>");
+          const target = firstToken(after.slice(redir[1].length));
+          const resolved = resolvePath(target, curDir, home);
+          if (resolved) ops.push({ op: "write", path: resolved, append });
+        }
+        continue;
+      }
     }
 
     // mkdir [-p] dir
@@ -90,6 +107,38 @@ export function extractBashFileOps(command: string, cwd: string): BashFileOp[] {
   }
 
   return ops;
+}
+
+/**
+ * Find the first `>` redirect operator at or after `from` that is NOT inside
+ * quotes. Echo/printf output text frequently contains literal `>` characters
+ * (e.g. `echo "a -> b"`), and only an unquoted `>` acts as a shell redirect.
+ * Returns -1 when there is no unquoted redirect in the text.
+ */
+function findRedirectOp(text: string, from: number): number {
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === ">") return i;
+  }
+  return -1;
 }
 
 /** Split on && / ; / | / newline, keeping quoted whitespace intact. */
@@ -164,6 +213,9 @@ function resolvePath(raw: string, curDir: string, home: string): string | null {
   // earlier, but `file &&` may leave a trailing && removed already).
   value = value.replace(/[;&|]+$/, "").trim();
   if (!value) return null;
+  // Shell glob patterns (e.g. `rm -rf *.txt`, `echo hi > logs-*.log`) expand
+  // to many files; never record the pattern itself as a literal path.
+  if (/[*?]/.test(value)) return null;
 
   if (value === "~") return home;
   if (value.startsWith("~/")) return joinPath(home, value.slice(2));

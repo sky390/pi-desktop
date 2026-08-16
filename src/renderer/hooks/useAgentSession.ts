@@ -108,16 +108,83 @@ export interface FileChangeItem {
   /** Unique id — the underlying tool call id, stable across renders. */
   id: string;
   path: string;
-  action: "edit" | "write" | "mkdir" | "delete";
+  action: "edit" | "create" | "modify" | "mkdir" | "delete";
   /** Unified diff/patch produced by the SDK's edit tool (edit only). */
   patch?: string;
-  /** Full new content written by the write tool or bash redirect (write only). */
+  /** Full new content written by the write tool or bash redirect (write/create). */
   content?: string;
   timestamp: number;
 }
 
 function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] } | null): QueuedMessages {
   return { steering: q?.steering ?? [], followUp: q?.followUp ?? [] };
+}
+
+/** Resolve the paths a tool call may write, for create-vs-modify probing. */
+function probeTargetsForTool(name: string, args: Record<string, unknown>, cwd: string): string[] {
+  if (name === "edit" || name === "write") {
+    const path = typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
+    return path ? [path] : [];
+  }
+  if (name === "bash") {
+    const command = typeof args.command === "string" ? args.command : "";
+    // Relative paths resolve against the session cwd; pass it through so the
+    // probe checks the same resolved path the end handler will record.
+    return extractBashFileOps(command, cwd).flatMap((op) => (op.op === "write" || op.op === "touch" ? [op.path] : []));
+  }
+  return [];
+}
+
+function sameFilePath(a: string, b: string): boolean {
+  return a.replace(/\//g, "\\").toLowerCase() === b.replace(/\//g, "\\").toLowerCase();
+}
+
+/**
+ * True when the most recent recorded change for `path` deleted it, so the file
+ * is currently absent. The existence probe runs at tool start, which can be
+ * stale when a delete and a re-create happen in the same bash command (e.g.
+ * `rm a.txt && echo hi > a.txt`); consulting the recorded history catches the
+ * re-create that would otherwise look like a modify.
+ */
+function isAbsentByHistory(changes: FileChangeItem[], path: string): boolean {
+  for (let i = changes.length - 1; i >= 0; i--) {
+    if (sameFilePath(changes[i].path, path)) return changes[i].action === "delete";
+  }
+  return false;
+}
+
+// Per-session file changes are persisted to localStorage so the Changes panel
+// survives app restarts and session switches. Keyed by session id.
+const FILE_CHANGES_STORAGE_PREFIX = "pi-desktop:file-changes:";
+
+function loadFileChanges(sessionId: string | null): FileChangeItem[] {
+  if (!sessionId) return [];
+  try {
+    const raw = localStorage.getItem(FILE_CHANGES_STORAGE_PREFIX + sessionId);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as FileChangeItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveFileChanges(sessionId: string | null, changes: FileChangeItem[]): void {
+  if (!sessionId) return;
+  try {
+    localStorage.setItem(FILE_CHANGES_STORAGE_PREFIX + sessionId, JSON.stringify(changes));
+  } catch {
+    // Quota exceeded: retry without content previews (the panel truncates them
+    // anyway when rendering).
+    try {
+      localStorage.setItem(
+        FILE_CHANGES_STORAGE_PREFIX + sessionId,
+        JSON.stringify(changes.map((c) => ({ ...c, content: undefined }))),
+      );
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 type ExtensionUiDialogRequest = Extract<ExtensionUiRequest, { method: "select" | "confirm" | "input" | "editor" }>;
@@ -347,9 +414,36 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
   const [fileChanges, setFileChanges] = useState<FileChangeItem[]>([]);
+  // Session whose changes are currently in `fileChanges`. Guards the save
+  // effect so a session switch never writes the previous session's changes
+  // under the new session's storage key while the load effect is in flight.
+  const fileChangesSessionRef = useRef<string | null>(session?.id ?? null);
+  // Set once persisted changes have been restored for the current session.
+  // Until then the initial empty state must NOT be saved, or it would wipe the
+  // stored history on every app start. This is a STATE (not a ref) on purpose:
+  // state updates only take effect on the next commit, so under StrictMode's
+  // effect double-invoke the save effect still sees `false` while the restore
+  // state update is in flight, and never writes the pre-restore empty list.
+  const [fileChangesReady, setFileChangesReady] = useState(false);
+
+  // Persist changes on every update. Defined BEFORE the session-load effect so
+  // that during a session switch the stale (previous session) value is never
+  // saved under the new session's key: the load effect updates the ref first,
+  // and the next save only runs once the ref matches the current session.
+  useEffect(() => {
+    if (fileChangesReady && !!fileChangesSessionRef.current && fileChangesSessionRef.current === sessionIdRef.current) {
+      saveFileChanges(fileChangesSessionRef.current, fileChanges);
+    }
+  }, [fileChanges, fileChangesReady]);
+
   // toolCallId -> raw tool args, captured at tool_execution_start so the end
   // event (which carries no args) can still resolve the edited path.
   const toolCallArgsRef = useRef<Map<string, Record<string, unknown>>>(new Map());
+  // toolCallId -> path -> existed-before-write, probed at tool_execution_start
+  // so writes can be classified as create (new file) vs modify (existing file).
+  // Stored as a Promise so the end event (which may arrive first) can await the
+  // probe result instead of racing it.
+  const toolCallExistsRef = useRef<Map<string, Promise<Map<string, boolean>>>>(new Map());
   // Session cwd used to resolve relative paths from bash commands.
   const sessionCwdRef = useRef<string>(session?.cwd ?? "");
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
@@ -1156,7 +1250,27 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           const id = event.toolCallId as string;
           const name = event.toolName as string;
           if (name === "edit" || name === "write" || name === "bash") {
-            toolCallArgsRef.current.set(id, (event.args as Record<string, unknown> | undefined) ?? {});
+            const args = (event.args as Record<string, unknown> | undefined) ?? {};
+            toolCallArgsRef.current.set(id, args);
+            // Fallback probe: the host normally attaches a sync fileExistsProbe
+            // to the end event (no race with the tool execution); this async
+            // probe only covers events that arrive without one.
+            const targets = probeTargetsForTool(name, args, sessionCwdRef.current || "");
+            if (targets.length > 0) {
+              toolCallExistsRef.current.set(
+                id,
+                Promise.all(
+                  targets.map(async (target) => {
+                    try {
+                      await readFilePayload(target, sessionIdRef.current);
+                      return [target, true] as const;
+                    } catch {
+                      return [target, false] as const;
+                    }
+                  }),
+                ).then((entries) => new Map(entries)),
+              );
+            }
           }
           setAgentPhase((prev) => {
             const tools = prev?.kind === "running_tools" ? [...prev.tools] : [];
@@ -1171,58 +1285,92 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (!event.isError) {
             const args = toolCallArgsRef.current.get(id) ?? {};
             toolCallArgsRef.current.delete(id);
-            if (name === "edit" || name === "write") {
-              const path =
-                typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
-              if (path) {
-                const patch =
-                  name === "edit"
-                    ? ((event.result as { details?: { patch?: unknown } } | undefined)?.details?.patch as
-                        string | undefined)
-                    : undefined;
-                const content = name === "write" && typeof args.content === "string" ? args.content : undefined;
-                setFileChanges((prev) => [
-                  ...prev,
-                  {
-                    id,
-                    path,
-                    action: name === "edit" ? "edit" : "write",
-                    patch,
-                    content,
+            const recordChanges = (existsMap: Map<string, boolean> | Record<string, boolean> | undefined) => {
+              const existedFor = (p: string): boolean | undefined =>
+                !existsMap ? undefined : existsMap instanceof Map ? existsMap.get(p) : existsMap[p];
+              if (name === "edit" || name === "write") {
+                const path =
+                  typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
+                if (path) {
+                  const patch =
+                    name === "edit"
+                      ? ((event.result as { details?: { patch?: unknown } } | undefined)?.details?.patch as
+                          string | undefined)
+                      : undefined;
+                  const content = name === "write" && typeof args.content === "string" ? args.content : undefined;
+                  const existed = existedFor(path);
+                  setFileChanges((prev) => {
+                    const absentByHistory = isAbsentByHistory(prev, path);
+                    const action =
+                      name === "edit" ? "edit" : existed === false || absentByHistory ? "create" : "modify";
+                    return [
+                      ...prev,
+                      {
+                        id,
+                        path,
+                        action,
+                        patch,
+                        content,
+                        timestamp: Date.now(),
+                      },
+                    ];
+                  });
+                }
+              } else if (name === "bash") {
+                // The bash tool has no structured file info in its result, so we
+                // parse the command for file operations (mkdir / > / >> / rm /
+                // touch) and record each as a change. Reads resolve relative
+                // paths against the session cwd.
+                const command = typeof args.command === "string" ? args.command : "";
+                const cwd = sessionCwdRef.current || "";
+                const ops = extractBashFileOps(command, cwd);
+                for (const op of ops) {
+                  const existed = existedFor(op.path);
+                  const change: FileChangeItem = {
+                    id: `${id}:${op.path}`,
+                    path: op.path,
+                    // Placeholder; the real action is recomputed inside the
+                    // setFileChanges callback so it can consult the history.
+                    action: "modify",
                     timestamp: Date.now(),
-                  },
-                ]);
-              }
-            } else if (name === "bash") {
-              // The bash tool has no structured file info in its result, so we
-              // parse the command for file operations (mkdir / > / >> / rm /
-              // touch) and record each as a change. Reads resolve relative
-              // paths against the session cwd.
-              const command = typeof args.command === "string" ? args.command : "";
-              const cwd = sessionCwdRef.current || "";
-              const ops = extractBashFileOps(command, cwd);
-              for (const op of ops) {
-                const change: FileChangeItem = {
-                  id: `${id}:${op.path}`,
-                  path: op.path,
-                  action: op.op === "mkdir" ? "mkdir" : op.op === "remove" ? "delete" : "write",
-                  timestamp: Date.now(),
-                };
-                setFileChanges((prev) => [...prev, change]);
-                // Best-effort content read for written files so the panel can
-                // preview what the command produced.
-                if (op.op === "write" || op.op === "touch") {
-                  void readFilePayload(op.path)
-                    .then((res) => {
-                      if (res.encoding === "utf8" && res.content) {
-                        setFileChanges((prev) =>
-                          prev.map((c) => (c.id === change.id ? { ...c, content: res.content } : c)),
-                        );
-                      }
-                    })
-                    .catch(() => {});
+                  };
+                  setFileChanges((prev) => {
+                    const action =
+                      op.op === "mkdir"
+                        ? "mkdir"
+                        : op.op === "remove"
+                          ? "delete"
+                          : existed === false || isAbsentByHistory(prev, op.path)
+                            ? "create"
+                            : "modify";
+                    return [...prev, { ...change, action }];
+                  });
+                  // Best-effort content read for written files so the panel can
+                  // preview what the command produced. Pass the session id so
+                  // the file is allowed even when it is not inside the cwd roots.
+                  if (op.op === "write" || op.op === "touch") {
+                    void readFilePayload(op.path, sessionIdRef.current)
+                      .then((res) => {
+                        if (res.encoding === "utf8" && res.content) {
+                          setFileChanges((prev) =>
+                            prev.map((c) => (c.id === change.id ? { ...c, content: res.content } : c)),
+                          );
+                        }
+                      })
+                      .catch(() => {});
+                  }
                 }
               }
+            };
+            // Prefer the host-attached sync probe (authoritative, no race with
+            // the tool execution); fall back to the async renderer probe.
+            const syncProbe = (event as { fileExistsProbe?: Record<string, boolean> }).fileExistsProbe;
+            if (syncProbe) {
+              recordChanges(syncProbe);
+            } else {
+              const existsPromise = toolCallExistsRef.current.get(id);
+              toolCallExistsRef.current.delete(id);
+              void Promise.resolve(existsPromise).then(recordChanges);
             }
           }
           setAgentPhase((prev) => {
@@ -1926,8 +2074,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setHistoryRevision(null);
     setPreviousCursor(null);
     setLoadingOlder(false);
-    setFileChanges([]);
+    // Restore persisted changes for this session (empty for a brand-new one)
+    // instead of always starting from an empty list. Hydration must be flagged
+    // BEFORE the restore so the save effect can persist the restored list;
+    // the initial empty state is only safe to save after this point.
+    const restored = loadFileChanges(session?.id ?? null);
+    fileChangesSessionRef.current = session?.id ?? null;
+    setFileChanges(restored);
+    setFileChangesReady(true);
     toolCallArgsRef.current.clear();
+    toolCallExistsRef.current.clear();
     if (session) {
       sessionIdRef.current = session.id;
       sessionCwdRef.current = session.cwd ?? "";

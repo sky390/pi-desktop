@@ -1,62 +1,40 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import type { FileChangeItem } from "@/hooks/useAgentSession";
 import { parseUnifiedPatch, type SplitDiffRow } from "@/lib/patch";
+import { buildTree, type TreeNode } from "@/lib/file-change-tree";
+import { useI18n } from "@/i18n";
+import { FolderIcon, getFileIcon } from "./FileIcons";
 
 interface Props {
   changes: FileChangeItem[];
   basePath?: string;
 }
 
-interface TreeNode {
-  name: string;
-  path: string;
-  isDir: boolean;
-  children: TreeNode[];
-  changes: FileChangeItem[];
+type NodeState = "normal" | "deleted" | "created";
+
+/**
+ * Final visual state of a tree node. A delete strikes the node through; a node
+ * that was ever created/mkdir'd (and not deleted since) stays green so a brand
+ * new file remains distinguishable even after later edits/modifies. Only a
+ * delete clears the created state; re-creating after a delete turns it green
+ * again.
+ */
+function nodeState(node: TreeNode): NodeState {
+  const last = node.changes[node.changes.length - 1];
+  if (!last) return "normal";
+  if (last.action === "delete") return "deleted";
+  if (node.changes.some((c) => c.action === "create" || c.action === "mkdir")) return "created";
+  return "normal";
 }
 
-function normalizePath(value: string): string {
-  return value.replace(/\//g, "\\");
-}
-
-function buildTree(changes: FileChangeItem[], basePath?: string): TreeNode {
-  const root: TreeNode = { name: "", path: "", isDir: true, children: [], changes: [] };
-  const base = basePath ? normalizePath(basePath).replace(/\\+$/, "") : "";
-  for (const change of changes) {
-    let display = normalizePath(change.path);
-    if (base && display.startsWith(base + "\\")) display = display.slice(base.length + 1);
-    const segments = display.split("\\").filter((s) => s && s !== ".");
-    // Skip a leading drive-letter segment so `C:\Users\...` renders without the drive.
-    if (segments.length > 0 && /^[A-Za-z]:$/.test(segments[0])) segments.shift();
-    if (segments.length === 0) continue;
-
-    let node = root;
-    segments.forEach((seg, i) => {
-      const isLast = i === segments.length - 1;
-      let child = node.children.find((c) => c.name === seg);
-      if (!child) {
-        child = {
-          name: seg,
-          path: node.path ? `${node.path}\\${seg}` : seg,
-          isDir: !isLast,
-          children: [],
-          changes: [],
-        };
-        node.children.push(child);
-      }
-      if (isLast) child.changes.push(change);
-      node = child;
-    });
+function nodeNameStyle(state: NodeState): CSSProperties {
+  if (state === "deleted") {
+    return { color: "var(--diff-del-text, #dc2626)", textDecoration: "line-through" };
   }
-  const sortTree = (n: TreeNode) => {
-    n.children.sort((a, b) => {
-      if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
-    n.children.forEach(sortTree);
-  };
-  sortTree(root);
-  return root;
+  if (state === "created") {
+    return { color: "var(--diff-add-text, #16a34a)" };
+  }
+  return {};
 }
 
 function countChanges(node: TreeNode): { added: number; removed: number; total: number } {
@@ -67,7 +45,8 @@ function countChanges(node: TreeNode): { added: number; removed: number; total: 
     for (const c of n.changes) {
       total++;
       if (c.action === "delete") removed++;
-      else if (c.action === "mkdir") added++;
+      else if (c.action === "mkdir" || c.action === "create") added++;
+      else if (c.action === "modify") added += Math.max(1, countPatchChanges(c.patch).added);
       else {
         added += countPatchChanges(c.patch).added;
         removed += countPatchChanges(c.patch).removed;
@@ -171,46 +150,25 @@ function DiffRow({ row }: { row: SplitDiffRow }) {
   );
 }
 
-const FOLDER_ICON = (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
-  </svg>
-);
-
-const FILE_ICON = (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
-    <path d="M14 2v6h6" />
-  </svg>
-);
-
-function ChangeDetail({ change }: { change: FileChangeItem }) {
+function ChangeDetail({ change, t }: { change: FileChangeItem; t: (key: string, fallback: string) => string }) {
   const accent =
-    change.action === "write"
-      ? "var(--accent)"
+    change.action === "create"
+      ? "var(--diff-add-text, #16a34a)"
       : change.action === "delete"
         ? "var(--diff-del-text, #dc2626)"
-        : "var(--text-muted)";
+        : change.action === "modify"
+          ? "var(--accent)"
+          : "var(--text-muted)";
+  const actionLabel =
+    change.action === "create"
+      ? t("fileChangeCreated", "Created")
+      : change.action === "modify"
+        ? t("fileChangeModified", "Modified")
+        : change.action === "edit"
+          ? t("fileChangeEdited", "Edited")
+          : change.action === "mkdir"
+            ? t("fileChangeDirectoryCreated", "Directory created")
+            : t("fileChangeDeleted", "Deleted");
   return (
     <div>
       <div
@@ -225,14 +183,10 @@ function ChangeDetail({ change }: { change: FileChangeItem }) {
           background: "var(--bg-panel)",
         }}
       >
-        <span style={{ color: accent, fontWeight: 500 }}>{change.action}</span>
-        <span>{formatRelativeTime(change.timestamp)}</span>
+        <span style={{ color: accent, fontWeight: 500 }}>{actionLabel}</span>
+        <span>{formatRelativeTime(change.timestamp, t)}</span>
       </div>
-      {change.action === "mkdir" ? (
-        <div style={{ padding: "6px 12px", fontSize: 12, color: "var(--text-dim)" }}>Directory created</div>
-      ) : change.action === "delete" ? (
-        <div style={{ padding: "6px 12px", fontSize: 12, color: "var(--diff-del-text, #dc2626)" }}>Deleted</div>
-      ) : change.patch ? (
+      {change.patch ? (
         <DiffView patch={change.patch} />
       ) : change.content ? (
         <pre
@@ -260,6 +214,7 @@ function ChangeDetail({ change }: { change: FileChangeItem }) {
 }
 
 export function FileChangesPanel({ changes, basePath }: Props) {
+  const { t } = useI18n();
   const [collapsedDirs, setCollapsedDirs] = useState<Record<string, boolean>>({});
   const [expandedFiles, setExpandedFiles] = useState<Record<string, boolean>>({});
   const root = useMemo(() => buildTree(changes, basePath), [changes, basePath]);
@@ -278,7 +233,7 @@ export function FileChangesPanel({ changes, basePath }: Props) {
           textAlign: "center",
         }}
       >
-        No file changes in this session yet
+        {t("fileChangesEmpty", "No file changes in this session yet")}
       </div>
     );
   }
@@ -286,10 +241,12 @@ export function FileChangesPanel({ changes, basePath }: Props) {
   const toggleDir = (path: string) => setCollapsedDirs((prev) => ({ ...prev, [path]: !prev[path] }));
   const toggleFile = (path: string) => setExpandedFiles((prev) => ({ ...prev, [path]: !prev[path] }));
 
-  const renderNode = (node: TreeNode, depth: number) => {
+  const renderNode = (node: TreeNode) => {
     if (node.isDir) {
       const collapsed = collapsedDirs[node.path] === true;
       const counts = countChanges(node);
+      const state = nodeState(node);
+      const nameStyle = nodeNameStyle(state);
       return (
         <div key={node.path || "root"}>
           <button
@@ -302,7 +259,7 @@ export function FileChangesPanel({ changes, basePath }: Props) {
               gap: 8,
               width: "100%",
               padding: "7px 10px",
-              paddingLeft: 10 + depth * 16,
+              paddingLeft: 8,
               background: "none",
               border: "none",
               cursor: "pointer",
@@ -313,8 +270,19 @@ export function FileChangesPanel({ changes, basePath }: Props) {
             }}
           >
             <span style={{ color: "var(--text-dim)", fontSize: 10, flexShrink: 0 }}>{collapsed ? "▸" : "▾"}</span>
-            <span style={{ color: "var(--accent)", display: "flex", flexShrink: 0 }}>{FOLDER_ICON}</span>
-            <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+            <span style={{ display: "flex", flexShrink: 0, color: "var(--text-dim)" }}>
+              <FolderIcon size={14} open={!collapsed} />
+            </span>
+            <span
+              style={{
+                minWidth: 0,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                flex: 1,
+                ...nameStyle,
+              }}
+            >
               {node.name}
             </span>
             <span style={{ display: "flex", gap: 6, flexShrink: 0, fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
@@ -323,13 +291,22 @@ export function FileChangesPanel({ changes, basePath }: Props) {
               <span style={{ color: "var(--text-dim)" }}>{counts.total}</span>
             </span>
           </button>
-          {!collapsed && <div>{node.children.map((child) => renderNode(child, depth + 1))}</div>}
+          {!collapsed && (
+            <div style={{ borderLeft: "1px solid var(--border)", marginLeft: 8 }}>
+              {node.changes.map((change) => (
+                <ChangeDetail key={change.id} change={change} t={t} />
+              ))}
+              {node.children.map((child) => renderNode(child))}
+            </div>
+          )}
         </div>
       );
     }
 
     const expanded = expandedFiles[node.path] === true;
     const counts = countChanges(node);
+    const state = nodeState(node);
+    const nameStyle = nodeNameStyle(state);
     return (
       <div key={node.path}>
         <button
@@ -342,7 +319,7 @@ export function FileChangesPanel({ changes, basePath }: Props) {
             gap: 8,
             width: "100%",
             padding: "6px 10px",
-            paddingLeft: 10 + depth * 16,
+            paddingLeft: 8,
             background: "none",
             border: "none",
             cursor: "pointer",
@@ -352,8 +329,17 @@ export function FileChangesPanel({ changes, basePath }: Props) {
           }}
         >
           <span style={{ color: "var(--text-dim)", fontSize: 10, flexShrink: 0 }}>{expanded ? "▾" : "▸"}</span>
-          <span style={{ color: "var(--text-dim)", display: "flex", flexShrink: 0 }}>{FILE_ICON}</span>
-          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>
+          <span style={{ display: "flex", flexShrink: 0, color: "var(--text-dim)" }}>{getFileIcon(node.name, 14)}</span>
+          <span
+            style={{
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              flex: 1,
+              ...nameStyle,
+            }}
+          >
             {node.name}
           </span>
           <span style={{ display: "flex", gap: 6, flexShrink: 0, fontSize: 12, fontVariantNumeric: "tabular-nums" }}>
@@ -363,9 +349,9 @@ export function FileChangesPanel({ changes, basePath }: Props) {
           </span>
         </button>
         {expanded && (
-          <div style={{ borderLeft: "1px solid var(--border)", marginLeft: 10 + depth * 16 + 14 }}>
+          <div style={{ borderLeft: "1px solid var(--border)", marginLeft: 8 }}>
             {node.changes.map((change) => (
-              <ChangeDetail key={change.id} change={change} />
+              <ChangeDetail key={change.id} change={change} t={t} />
             ))}
           </div>
         )}
@@ -375,19 +361,19 @@ export function FileChangesPanel({ changes, basePath }: Props) {
 
   return (
     <div style={{ height: "100%", overflowY: "auto", overflowX: "hidden" }}>
-      {root.children.map((child) => renderNode(child, 0))}
+      {root.children.map((child) => renderNode(child))}
     </div>
   );
 }
 
-function formatRelativeTime(timestamp: number): string {
+function formatRelativeTime(timestamp: number, t: (key: string, fallback: string) => string): string {
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 60) return t("fileChangeTimeSecondsAgo", "{n}s ago").replace("{n}", String(seconds));
   const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
+  if (minutes < 60) return t("fileChangeTimeMinutesAgo", "{n}m ago").replace("{n}", String(minutes));
   const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
+  if (hours < 24) return t("fileChangeTimeHoursAgo", "{n}h ago").replace("{n}", String(hours));
+  return t("fileChangeTimeDaysAgo", "{n}d ago").replace("{n}", String(Math.round(hours / 24)));
 }
 
 function countPatchChanges(patch: string | undefined): { added: number; removed: number } {
