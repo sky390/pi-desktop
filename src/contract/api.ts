@@ -10,7 +10,6 @@ import type {
   FileMeta,
   HistoryWindow,
   LoginProgressEvent,
-  ModelPreferencesResult,
   ModelsConfig,
   ModelsListResult,
   PagedContextInfo,
@@ -289,14 +288,6 @@ export interface Api {
         error?: string;
       }>;
     };
-  };
-  "models.preferences.get": {
-    params: { cwd?: string } | void;
-    result: ModelPreferencesResult;
-  };
-  "models.preferences.set": {
-    params: { cwd?: string; enabledModels: string[] | null };
-    result: ModelPreferencesResult;
   };
   /** Built-in providers with their current overlay (custom Base URL / enabled models). */
   "modelsConfig.providers": { params: void; result: { providers: BuiltinProviderInfo[] } };
