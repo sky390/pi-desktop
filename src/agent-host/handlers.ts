@@ -16,7 +16,7 @@ import {
   writeFileSync,
 } from "fs";
 import { execSync } from "child_process";
-import { ProxyAgent } from "undici";
+import { fetch as undiciFetch, ProxyAgent } from "undici";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { homedir, tmpdir } from "os";
 import { applyProxyEnvVars, configureProxyDispatcher } from "./proxy-config";
@@ -384,17 +384,25 @@ export async function runProxyProbe(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const startedAt = Date.now();
-  let dispatcher: ProxyAgent | undefined;
   try {
-    dispatcher = new ProxyAgent(proxyUrl);
-    const response = await fetch(url, {
-      method: "GET",
-      dispatcher,
-      redirect: "manual",
-      signal: controller.signal,
-    });
-    // Any HTTP response (even 401/403) proves the proxy reached the target.
-    return { protocol, ok: true, status: response.status, latencyMs: Date.now() - startedAt };
+    // Use undici's own fetch: the global fetch's dispatcher option expects the
+    // undici-types bundle pulled in by @types/node, which is incompatible with
+    // undici's bundled types when the two versions diverge.
+    const dispatcher = new ProxyAgent(proxyUrl);
+    try {
+      const response = await undiciFetch(url, {
+        method: "GET",
+        dispatcher,
+        redirect: "manual",
+        signal: controller.signal,
+      });
+      // Any HTTP response (even 401/403) proves the proxy reached the target.
+      return { protocol, ok: true, status: response.status, latencyMs: Date.now() - startedAt };
+    } finally {
+      // Invalid proxy URLs throw from `new ProxyAgent` before this point and
+      // fall through to the outer catch.
+      void dispatcher.close().catch(() => {});
+    }
   } catch (error) {
     const cause = error instanceof Error && error.cause instanceof Error ? error.cause : error;
     const message =
@@ -406,7 +414,6 @@ export async function runProxyProbe(
     return { protocol, ok: false, error: message, latencyMs: Date.now() - startedAt };
   } finally {
     clearTimeout(timer);
-    if (dispatcher) void dispatcher.close().catch(() => {});
   }
 }
 
