@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { APP_MONO_FONT_FAMILY, APP_SANS_FONT_FAMILY } from "./font-stack.ts";
+import { APP_SANS_FONT_FAMILY } from "./font-stack.ts";
 
 function cssCustomProperty(source, property) {
   const match = source.match(new RegExp(`${property}:\\s*([^;]+);`));
