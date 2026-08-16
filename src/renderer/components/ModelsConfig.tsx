@@ -2672,14 +2672,17 @@ export function ModelsConfig({
           const body = (await r.json().catch(() => ({}))) as { error?: string };
           throw new Error(body.error ?? `HTTP ${r.status}`);
         }
-        return r.json() as Promise<ModelsJson & { error?: string }>;
+        return r.json() as Promise<{ config?: ModelsJson; version?: string } & { error?: string }>;
       })
       .then((d) => {
         if (d.error) throw new Error(d.error);
-        const normalized = d.providers ? d : { ...d, providers: {} };
-        setConfig(normalized);
+        // The snapshot wraps the editor config in `config` alongside its CAS
+        // `version`; keep the two apart so saving can pass `expectedVersion`.
+        setConfigVersion(d.version ?? "");
+        const cfg = (d.config ?? {}) as ModelsJson;
+        setConfig({ ...cfg, providers: cfg.providers ?? {} });
         setConfigLoaded(true);
-        const keys = Object.keys(normalized.providers ?? {});
+        const keys = Object.keys(cfg.providers ?? {});
         if (keys.length > 0) setSelection({ type: "provider", name: keys[0] });
       })
       .catch((e) => {

@@ -203,7 +203,7 @@ function TreeNode({
           </span>
           <span
             style={{
-              fontSize: 13,
+              fontSize: 14,
               color: "var(--text)",
               overflow: "hidden",
               textOverflow: "ellipsis",
@@ -292,7 +292,7 @@ function TreeNode({
             <div
               style={{
                 paddingLeft: 8 + (depth + 1) * 14,
-                fontSize: 12,
+                fontSize: 13,
                 color: "var(--text-dim)",
                 height: 32,
                 display: "flex",
@@ -387,14 +387,14 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
 
   if (loading) {
     return (
-      <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>
+      <div style={{ padding: "8px 12px", fontSize: 12, color: "var(--text-dim)" }}>
         {t("loadingFiles", "Loading files…")}
       </div>
     );
   }
 
   if (error) {
-    return <div style={{ padding: "8px 12px", fontSize: 11, color: "#f87171" }}>{error}</div>;
+    return <div style={{ padding: "8px 12px", fontSize: 12, color: "#f87171" }}>{error}</div>;
   }
 
   return (
@@ -405,7 +405,7 @@ export function FileExplorer({ cwd, onOpenFile, refreshKey, onAtMention }: Props
           alignItems: "center",
           gap: 7,
           padding: "5px 8px 7px",
-          fontSize: 10.5,
+          fontSize: 11.5,
           color: "var(--text-dim)",
           borderBottom: "1px solid var(--border)",
           marginBottom: 3,

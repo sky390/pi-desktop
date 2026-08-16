@@ -178,7 +178,7 @@ export function BrowserDock({ visible, ownerSessionId }: { visible: boolean; own
               border: `1px solid ${tab.id === state.activeTabId ? "var(--border)" : "transparent"}`,
               borderRadius: 5,
               cursor: "pointer",
-              fontSize: 10,
+              fontSize: 11.5,
             }}
           >
             {tab.loading ? (
@@ -281,7 +281,7 @@ export function BrowserDock({ visible, ownerSessionId }: { visible: boolean; own
               borderRadius: 6,
               background: "var(--bg)",
               color: "var(--text)",
-              fontSize: 11,
+              fontSize: 12,
               outline: "none",
             }}
           />
@@ -544,7 +544,7 @@ const emptyStyle = {
   padding: 18,
   textAlign: "center" as const,
   color: "var(--text-muted)",
-  fontSize: 11,
+  fontSize: 12,
 };
 const iconButtonStyle = {
   width: 28,
@@ -567,7 +567,7 @@ const selectStyle = {
   borderRadius: 5,
   background: "var(--bg)",
   color: "var(--text-muted)",
-  fontSize: 10,
+  fontSize: 11,
 };
 const primaryButtonStyle = {
   minHeight: 32,
@@ -587,5 +587,5 @@ const tinyButtonStyle = {
   background: "var(--bg)",
   color: "var(--text-muted)",
   cursor: "pointer",
-  fontSize: 9,
+  fontSize: 10,
 };

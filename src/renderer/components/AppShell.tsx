@@ -1526,7 +1526,7 @@ export function AppShell() {
                 borderRight: "1px solid var(--border)",
                 color: activeFileTabId === EXPLORER_TAB_ID ? "var(--text)" : "var(--text-muted)",
                 cursor: "pointer",
-                fontSize: 12,
+                fontSize: 13,
                 fontWeight: activeFileTabId === EXPLORER_TAB_ID ? 500 : 400,
               }}
             >
@@ -1561,7 +1561,7 @@ export function AppShell() {
                 borderRight: "1px solid var(--border)",
                 color: activeFileTabId === BROWSER_TAB_ID ? "var(--text)" : "var(--text-muted)",
                 cursor: "pointer",
-                fontSize: 12,
+                fontSize: 13,
                 fontWeight: activeFileTabId === BROWSER_TAB_ID ? 500 : 400,
               }}
             >
@@ -1597,7 +1597,7 @@ export function AppShell() {
                 borderRight: "1px solid var(--border)",
                 color: activeFileTabId === CHANGES_TAB_ID ? "var(--text)" : "var(--text-muted)",
                 cursor: "pointer",
-                fontSize: 12,
+                fontSize: 13,
                 fontWeight: activeFileTabId === CHANGES_TAB_ID ? 500 : 400,
               }}
             >
