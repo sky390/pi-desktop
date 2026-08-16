@@ -31,6 +31,8 @@ import { getToolNamesForPreset, type ToolEntry } from "@/lib/tool-presets";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import { subscribeActiveSessionLiveSync } from "./active-session-live-sync";
 import { isNearChatBottom, shouldStopChatAutoFollow } from "./chat-scroll-policy";
+import { extractBashFileOps } from "@/lib/bash-file-ops";
+import { readFilePayload } from "@/lib/file-blob";
 import {
   consumeSessionLoadTrace,
   failSessionLoadTrace,
@@ -100,6 +102,18 @@ interface LastAssistantTextResponse {
 export interface QueuedMessages {
   steering: string[];
   followUp: string[];
+}
+
+export interface FileChangeItem {
+  /** Unique id — the underlying tool call id, stable across renders. */
+  id: string;
+  path: string;
+  action: "edit" | "write" | "mkdir" | "delete";
+  /** Unified diff/patch produced by the SDK's edit tool (edit only). */
+  patch?: string;
+  /** Full new content written by the write tool or bash redirect (write only). */
+  content?: string;
+  timestamp: number;
 }
 
 function normalizeQueuedMessages(q?: { steering?: string[]; followUp?: string[] } | null): QueuedMessages {
@@ -332,6 +346,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [extensionQuestionnaire, setExtensionQuestionnaire] = useState<ExtensionUiQuestionnaireRequest | null>(null);
   const [extensionStatuses, setExtensionStatuses] = useState<ExtensionStatusItem[]>([]);
   const [extensionWidgets, setExtensionWidgets] = useState<ExtensionWidgetItem[]>([]);
+  const [fileChanges, setFileChanges] = useState<FileChangeItem[]>([]);
+  // toolCallId -> raw tool args, captured at tool_execution_start so the end
+  // event (which carries no args) can still resolve the edited path.
+  const toolCallArgsRef = useRef<Map<string, Record<string, unknown>>>(new Map());
+  // Session cwd used to resolve relative paths from bash commands.
+  const sessionCwdRef = useRef<string>(session?.cwd ?? "");
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessages>({ steering: [], followUp: [] });
   const [previousCursor, setPreviousCursor] = useState<string | null>(null);
   const [historyRevision, setHistoryRevision] = useState<string | null>(null);
@@ -1135,6 +1155,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         case "tool_execution_start": {
           const id = event.toolCallId as string;
           const name = event.toolName as string;
+          if (name === "edit" || name === "write" || name === "bash") {
+            toolCallArgsRef.current.set(id, (event.args as Record<string, unknown> | undefined) ?? {});
+          }
           setAgentPhase((prev) => {
             const tools = prev?.kind === "running_tools" ? [...prev.tools] : [];
             if (!tools.some((t) => t.id === id)) tools.push({ id, name });
@@ -1144,6 +1167,64 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         case "tool_execution_end": {
           const id = event.toolCallId as string;
+          const name = event.toolName as string;
+          if (!event.isError) {
+            const args = toolCallArgsRef.current.get(id) ?? {};
+            toolCallArgsRef.current.delete(id);
+            if (name === "edit" || name === "write") {
+              const path =
+                typeof args.path === "string" ? args.path : typeof args.file_path === "string" ? args.file_path : "";
+              if (path) {
+                const patch =
+                  name === "edit"
+                    ? ((event.result as { details?: { patch?: unknown } } | undefined)?.details?.patch as
+                        string | undefined)
+                    : undefined;
+                const content = name === "write" && typeof args.content === "string" ? args.content : undefined;
+                setFileChanges((prev) => [
+                  ...prev,
+                  {
+                    id,
+                    path,
+                    action: name === "edit" ? "edit" : "write",
+                    patch,
+                    content,
+                    timestamp: Date.now(),
+                  },
+                ]);
+              }
+            } else if (name === "bash") {
+              // The bash tool has no structured file info in its result, so we
+              // parse the command for file operations (mkdir / > / >> / rm /
+              // touch) and record each as a change. Reads resolve relative
+              // paths against the session cwd.
+              const command = typeof args.command === "string" ? args.command : "";
+              const cwd = sessionCwdRef.current || "";
+              const ops = extractBashFileOps(command, cwd);
+              for (const op of ops) {
+                const change: FileChangeItem = {
+                  id: `${id}:${op.path}`,
+                  path: op.path,
+                  action: op.op === "mkdir" ? "mkdir" : op.op === "remove" ? "delete" : "write",
+                  timestamp: Date.now(),
+                };
+                setFileChanges((prev) => [...prev, change]);
+                // Best-effort content read for written files so the panel can
+                // preview what the command produced.
+                if (op.op === "write" || op.op === "touch") {
+                  void readFilePayload(op.path)
+                    .then((res) => {
+                      if (res.encoding === "utf8" && res.content) {
+                        setFileChanges((prev) =>
+                          prev.map((c) => (c.id === change.id ? { ...c, content: res.content } : c)),
+                        );
+                      }
+                    })
+                    .catch(() => {});
+                }
+              }
+            }
+          }
           setAgentPhase((prev) => {
             if (prev?.kind !== "running_tools") return prev;
             const tools = prev.tools.filter((t) => t.id !== id);
@@ -1845,8 +1926,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setHistoryRevision(null);
     setPreviousCursor(null);
     setLoadingOlder(false);
+    setFileChanges([]);
+    toolCallArgsRef.current.clear();
     if (session) {
       sessionIdRef.current = session.id;
+      sessionCwdRef.current = session.cwd ?? "";
 
       // Subscribe even when the session is currently idle. IM turns can start
       // without a desktop prompt, so waiting for agentState.running would miss
@@ -2087,6 +2171,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     extensionQuestionnaire,
     extensionStatuses,
     extensionWidgets,
+    fileChanges,
     respondToExtensionUi,
     respondToExtensionQuestionnaire,
     sendExtensionCustomInput,

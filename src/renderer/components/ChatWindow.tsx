@@ -20,7 +20,7 @@ import { MessageView } from "./MessageView";
 import { SessionProfiler } from "./SessionProfiler";
 import { ChatInput, type ChatInputHandle } from "./ChatInput";
 import { ChatMinimap, useMessageRefs, type ChatMinimapMessage } from "./ChatMinimap";
-import { useAgentSession, type AgentPhase, type NoticeItem } from "@/hooks/useAgentSession";
+import { useAgentSession, type AgentPhase, type FileChangeItem, type NoticeItem } from "@/hooks/useAgentSession";
 import { useAudio } from "@/hooks/useAudio";
 import { useDragDrop } from "@/hooks/useDragDrop";
 import { useIsMobile } from "@/hooks/useIsMobile";
@@ -50,6 +50,7 @@ interface Props {
   onContextUsageChange?: (
     usage: { percent: number | null; contextWindow: number; tokens: number | null } | null,
   ) => void;
+  onFileChangesChange?: (changes: FileChangeItem[]) => void;
   onOpenFile?: (filePath: string) => void;
 }
 
@@ -258,6 +259,7 @@ export function ChatWindow({
   onSessionStatsChange,
   onSessionStatsPanelOpen,
   onContextUsageChange,
+  onFileChangesChange,
   onOpenFile,
 }: Props) {
   const { soundEnabled, onSoundToggle, playDoneSound, unlockAudio } = useAudio();
@@ -317,6 +319,7 @@ export function ChatWindow({
     extensionQuestionnaire,
     extensionStatuses,
     extensionWidgets,
+    fileChanges,
     respondToExtensionUi,
     respondToExtensionQuestionnaire,
     sendExtensionCustomInput,
@@ -405,6 +408,19 @@ export function ChatWindow({
       onContextUsageChange?.(null);
     },
     [onContextUsageChange],
+  );
+
+  // Push file change records up to AppShell for the right-hand Changes panel.
+  const fileChangesRef = useRef(fileChanges);
+  fileChangesRef.current = fileChanges;
+  useEffect(() => {
+    onFileChangesChange?.(fileChangesRef.current);
+  }, [fileChanges, onFileChangesChange]);
+  useEffect(
+    () => () => {
+      onFileChangesChange?.([]);
+    },
+    [onFileChangesChange],
   );
 
   const onDrop = useCallback(
@@ -1030,6 +1046,10 @@ function ExtensionWidgets({ widgets }: { widgets: Array<{ key: string; lines: st
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 10 }}>
       {widgets.map((widget) => {
+        // An extension widget that renders no lines (e.g. the todo overlay after
+        // the previous turn's completed tasks are hidden) has no content to show —
+        // skip the whole box instead of leaving an empty title bar on screen.
+        if (widget.lines.length === 0) return null;
         const isCollapsed = collapsed[widget.key] === true;
         const displayLines = isCollapsed ? widget.lines.slice(0, 1) : widget.lines;
         return (

@@ -14,6 +14,8 @@ import { ChatWindow } from "./ChatWindow";
 import { FileExplorer } from "./FileExplorer";
 import { FileViewer } from "./FileViewer";
 import { TabBar } from "./TabBar";
+import { FileChangesPanel } from "./FileChangesPanel";
+import type { FileChangeItem } from "@/hooks/useAgentSession";
 import { SettingsConfig, type SettingsTab } from "./SettingsConfig";
 import { QuickChannelBinding } from "./channels/QuickChannelBinding";
 import { BrowserDock } from "./browser/BrowserDock";
@@ -51,6 +53,7 @@ type SessionCopyField = "file" | "id";
 type SessionCopyFeedback = { field: SessionCopyField; status: "copied" | "error" };
 const EXPLORER_TAB_ID = "explorer";
 const BROWSER_TAB_ID = "browser";
+const CHANGES_TAB_ID = "changes";
 const BROWSER_PANEL_WIDTH_KEY = "pi-desktop.browser-panel-width";
 const EMPTY_CHANNELS: ChannelsSnapshot = { accounts: [], statuses: [], pairings: [], bindings: [], activities: [] };
 
@@ -148,6 +151,11 @@ export function AppShell() {
     setSessionStats(stats);
   }, []);
   const [sessionCopyFeedback, setSessionCopyFeedback] = useState<SessionCopyFeedback | null>(null);
+  // File changes recorded by ChatWindow, shown in the right-hand Changes tab.
+  const [fileChanges, setFileChanges] = useState<FileChangeItem[]>([]);
+  const handleFileChangesChange = useCallback((changes: FileChangeItem[]) => {
+    setFileChanges(changes);
+  }, []);
   const sessionCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleCopySessionField = useCallback((field: SessionCopyField, value: string) => {
     if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
@@ -1396,6 +1404,7 @@ export function AppShell() {
                   onSessionStatsChange={handleSessionStatsChange}
                   onSessionStatsPanelOpen={openSessionStatsPanel}
                   onContextUsageChange={handleContextUsageChange}
+                  onFileChangesChange={handleFileChangesChange}
                   onOpenFile={handleOpenLinkedFile}
                 />
               </SessionProfiler>
@@ -1572,6 +1581,43 @@ export function AppShell() {
               </svg>
               {t("browser", "Browser")}
             </button>
+            <button
+              type="button"
+              onClick={() => dispatchFileTab({ type: "select", tabId: CHANGES_TAB_ID })}
+              aria-pressed={activeFileTabId === CHANGES_TAB_ID}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                height: 36,
+                padding: "0 12px",
+                flexShrink: 0,
+                background: activeFileTabId === CHANGES_TAB_ID ? "var(--bg)" : "var(--bg-panel)",
+                border: "none",
+                borderRight: "1px solid var(--border)",
+                color: activeFileTabId === CHANGES_TAB_ID ? "var(--text)" : "var(--text-muted)",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: activeFileTabId === CHANGES_TAB_ID ? 500 : 400,
+              }}
+            >
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 3v18" />
+                <path d="M5 10l7-7 7 7" />
+                <path d="M5 14l7 7 7-7" />
+              </svg>
+              {t("changes", "Changes")}
+            </button>
             <div style={{ flex: 1, overflow: "hidden" }}>
               <TabBar
                 tabs={fileTabs}
@@ -1630,7 +1676,9 @@ export function AppShell() {
 
           {/* Browser, Explorer or file content */}
           <div style={{ flex: 1, overflow: "hidden" }}>
-            {activeFileTabId === BROWSER_TAB_ID ? (
+            {activeFileTabId === CHANGES_TAB_ID ? (
+              <FileChangesPanel changes={fileChanges} basePath={activeCwd ?? selectedSession?.cwd ?? undefined} />
+            ) : activeFileTabId === BROWSER_TAB_ID ? (
               <BrowserDock
                 visible={rightPanelOpen && !settingsOpen && !browserAuthorization}
                 ownerSessionId={selectedSession?.id ?? null}
