@@ -1,6 +1,6 @@
 {
   "name": "@sky390/pi-desktop",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "private": true,
   "description": "Pi Agent Desktop — pure Electron desktop app for the pi coding agent",
   "homepage": "https://github.com/sky390/pi-desktop#readme",
